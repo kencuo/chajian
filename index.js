@@ -1,8 +1,8 @@
 /**
  * 智能媒体助手 - SillyTavern Extension
  * 统一的图片和文档处理插件
- * 作者: kencuo
- * 版本: 1.0.0
+ * 作者: ctrl
+ * 版本: 1.4
  */
 
 import { saveSettingsDebounced } from '../../../../script.js';
@@ -232,7 +232,8 @@ class ImageProcessor {
             const base64Content = imageData.split(',')[1];
             const fileExtension = 'jpg';
             const uniqueId = `${Date.now()}_${getStringHash(file.name)}`;
-            const storagePath = 'user/images';
+            // subfolder under SillyTavern's user images dir: .../user/images/phone/<filename>
+            const storagePath = 'phone';
 
             const savedUrl = await saveBase64AsFile(base64Content, storagePath, uniqueId, fileExtension);
 
@@ -375,10 +376,10 @@ class DocumentProcessor {
         typeof window.addOneMessage === 'function'
           ? window.addOneMessage
           : typeof parent.addOneMessage === 'function'
-          ? parent.addOneMessage
-          : typeof top.addOneMessage === 'function'
-          ? top.addOneMessage
-          : null;
+            ? parent.addOneMessage
+            : typeof top.addOneMessage === 'function'
+              ? top.addOneMessage
+              : null;
 
       if (addOneMessage) {
         // 限制显示长度
@@ -778,7 +779,8 @@ function bindCollapsibleEvents() {
   setCollapsed(collapsed);
 
   // 点击切换（使用 mousedown 并阻止冒泡，避免被外部“点击外部关闭”逻辑立即折叠）
-  $toggle.off('.sma')
+  $toggle
+    .off('.sma')
     .attr('role', 'button')
     .attr('tabindex', '0')
     .on('mousedown.sma', function (e) {
@@ -942,7 +944,7 @@ async function processTextBridge(text, options = {}) {
 }
 function exposeGlobalBridge() {
   try {
-    const target = (typeof window !== 'undefined' ? window : globalThis);
+    const target = typeof window !== 'undefined' ? window : globalThis;
     target.smartMediaAssistant = target.smartMediaAssistant || {};
     if (typeof target.smartMediaAssistant.processText !== 'function') {
       target.smartMediaAssistant.processText = (text, options) => processTextBridge(text, options);
@@ -954,5 +956,7 @@ function exposeGlobalBridge() {
     console.warn('[Smart Media Assistant] 暴露全局桥接失败', e);
   }
 }
-try { exposeGlobalBridge(); } catch (e) {}
+try {
+  exposeGlobalBridge();
+} catch (e) {}
 export { DocumentProcessor, FileProcessor, FileTypeDetector, FileValidator, ImageProcessor };
