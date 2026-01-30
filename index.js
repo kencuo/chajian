@@ -2,7 +2,7 @@
  * 智能媒体助手 - SillyTavern Extension
  * 统一的图片和文档处理插件
  * 作者: ctrl
- * 版本: 1.4
+ * 版本: 1.5
  */
 
 import { saveSettingsDebounced } from '../../../../script.js';
@@ -66,7 +66,11 @@ let pluginConfig = {};
  * 初始化插件配置
  */
 function initConfig() {
-  const context = getContext();
+  const context = typeof getContext === 'function' ? getContext() : null;
+  if (!context) {
+    throw new Error('[Smart Media Assistant] getContext() 不可用：请确认在 SillyTavern 扩展环境中运行');
+  }
+  context.extensionSettings = context.extensionSettings || {};
   const extensionSettings = context.extensionSettings[MODULE_NAME] || {};
 
   // 合并默认配置和用户配置
@@ -96,7 +100,8 @@ class FileTypeDetector {
     // 检测图片
     const isImageByType = pluginConfig.supportedImageTypes.includes(fileType) || fileType.startsWith('image/');
     const isImageByExt = pluginConfig.supportedImageExtensions.includes(fileExtension);
-    const isImage = isImageByType || (fileType.startsWith('image/') && isImageByExt);
+    // 有些环境（尤其移动端/拖拽）可能拿不到 file.type，此时用扩展名兜底
+    const isImage = isImageByType || isImageByExt;
 
     // 检测文档
     const isDocumentByType =
@@ -199,6 +204,11 @@ class ImageProcessor {
       const img = new Image();
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        throw new Error('无法获取 Canvas 2D 上下文');
+      }
+
+      const objectUrl = URL.createObjectURL(file);
 
       return new Promise((resolve, reject) => {
         img.onload = async () => {
@@ -227,6 +237,9 @@ class ImageProcessor {
             // 转换为base64
             const quality = pluginConfig.imageQuality / 100;
             const imageData = canvas.toDataURL('image/jpeg', quality);
+            if (!imageData || !imageData.includes(',')) {
+              throw new Error('图片编码失败');
+            }
 
             // 保存文件
             const base64Content = imageData.split(',')[1];
@@ -234,6 +247,10 @@ class ImageProcessor {
             const uniqueId = `${Date.now()}_${getStringHash(file.name)}`;
             // subfolder under SillyTavern's user images dir: .../user/images/phone/<filename>
             const storagePath = 'phone';
+
+            if (typeof saveBase64AsFile !== 'function') {
+              throw new Error('saveBase64AsFile 不可用：请确认 SillyTavern 版本与扩展加载路径正确');
+            }
 
             const savedUrl = await saveBase64AsFile(base64Content, storagePath, uniqueId, fileExtension);
 
@@ -258,11 +275,21 @@ class ImageProcessor {
             resolve(result);
           } catch (error) {
             reject(error);
+          } finally {
+            // 释放 blob URL，避免内存泄漏
+            try {
+              URL.revokeObjectURL(objectUrl);
+            } catch (_) {}
           }
         };
 
-        img.onerror = () => reject(new Error('图片加载失败'));
-        img.src = URL.createObjectURL(file);
+        img.onerror = () => {
+          try {
+            URL.revokeObjectURL(objectUrl);
+          } catch (_) {}
+          reject(new Error('图片加载失败'));
+        };
+        img.src = objectUrl;
       });
     } catch (error) {
       if (pluginConfig.showProcessingInfo) {
@@ -421,6 +448,11 @@ class DocumentProcessor {
         if (pluginConfig.enableLogging) {
           console.log('[Document Processor] 文档已发送到聊天');
         }
+      } else {
+        // 兜底：某些版本/嵌入方式下 addOneMessage 不在 window 上，尝试走 slash /send
+        try {
+          await processTextBridge(content, { name: fileName });
+        } catch (_) {}
       }
     } catch (error) {
       console.error('[Document Processor] 发送文档失败:', error);
@@ -499,7 +531,7 @@ window.__uploadMultipleImagesByPlugin = async function (files, options = {}) {
     const file = files[i];
     try {
       console.log(`🖼️ 处理第 ${i + 1}/${files.length} 张图片: ${file.name}`);
-      const result = await ImageProcessor.processImage(file);
+      const result = await ImageProcessor.processImage(file, options);
 
       // 为多图片结果添加索引信息
       result.multiImageIndex = i + 1;
@@ -871,7 +903,9 @@ function bindEventListeners() {
  * 保存设置
  */
 function saveSettings() {
-  const context = getContext();
+  const context = typeof getContext === 'function' ? getContext() : null;
+  if (!context) return;
+  context.extensionSettings = context.extensionSettings || {};
   context.extensionSettings[MODULE_NAME] = pluginConfig;
   saveSettingsDebounced();
 
