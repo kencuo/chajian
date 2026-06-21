@@ -792,7 +792,7 @@ function createSettingsHTML() {
     <div id="smart-media-assistant" class="extension-root">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>识图插件 byctrl</b>
+          <b>ctrl大杂烩！</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
