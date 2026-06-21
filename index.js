@@ -1252,7 +1252,7 @@ function bindEventListeners() {
       }
     } catch (error) {
       if (typeof toastr !== 'undefined') {
-        toastr.error(error.message || String(error), 'TTS 试听失败');
+        toastr.error(getFriendlyFetchErrorMessage(error, pluginConfig.ttsProvider), 'TTS 试听失败');
       }
     }
   });
@@ -1497,6 +1497,21 @@ async function parseRemoteError(response, fallbackMessage) {
   }
 }
 
+function getFriendlyFetchErrorMessage(error, provider = '') {
+  const rawMessage = String(error?.message || error || '').trim();
+  if (!rawMessage) return '请求失败';
+
+  const lowered = rawMessage.toLowerCase();
+  if (lowered.includes('failed to fetch') || lowered.includes('networkerror')) {
+    if (provider === 'minimax') {
+      return '请求被浏览器拦截或接口不可达。常见原因：CORS、源站选错、接口地址不通，或当前网络无法访问 MiniMax。';
+    }
+    return '请求被浏览器拦截或接口不可达。常见原因：CORS、接口地址错误、HTTPS/HTTP 混用，或网络不可达。';
+  }
+
+  return rawMessage;
+}
+
 async function synthesizeMiniMaxSpeech(text) {
   const apiKey = String(pluginConfig.ttsApiKey || '').trim();
   const groupId = String(pluginConfig.ttsGroupId || '').trim();
@@ -1510,7 +1525,6 @@ async function synthesizeMiniMaxSpeech(text) {
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
-      'MM-API-Source': 'SillyTavern-TTS',
     },
     body: JSON.stringify({
       model: String(pluginConfig.ttsModel || '').trim() || 'speech-2.8-hd',
@@ -1938,7 +1952,7 @@ function bindNativeTtsMenuEvents() {
       await speakChatMessageById(messageId, 'content', { source: 'st-native-menu' });
       showTtsToast('开始朗读消息正文', 'success');
     } catch (error) {
-      showTtsToast(error.message || String(error), 'error');
+      showTtsToast(getFriendlyFetchErrorMessage(error, pluginConfig.ttsProvider), 'error');
     }
   });
 }
@@ -2032,7 +2046,7 @@ async function handleTtsSlashCommand(args = {}, value = '') {
     showTtsToast('开始朗读消息正文', 'success');
     return '';
   } catch (error) {
-    showTtsToast(error.message || String(error), 'error');
+    showTtsToast(getFriendlyFetchErrorMessage(error, pluginConfig.ttsProvider), 'error');
     return '';
   }
 }
