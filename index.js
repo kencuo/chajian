@@ -23,6 +23,17 @@ const DEFAULT_CONFIG = {
   enableAIReading: true,
   showProcessingInfo: false,
   enableLogging: false,
+  enableTTS: true,
+  ttsProvider: 'browser',
+  ttsApiUrl: '',
+  ttsApiKey: '',
+  ttsModel: '',
+  ttsVoiceId: '',
+  ttsFormat: 'mp3',
+  ttsSpeed: 1,
+  ttsVolume: 1,
+  ttsPitch: 0,
+  ttsTestText: '你好，这是一段 TTS 试听内容。',
 
   // 内部配置
   supportedImageTypes: ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'],
@@ -60,7 +71,57 @@ const DEFAULT_CONFIG = {
 };
 
 // 全局配置管理
-let pluginConfig = {};
+let pluginConfig = { ...DEFAULT_CONFIG };
+const ttsPlaybackState = {
+  audioElement: null,
+  currentObjectUrl: '',
+  activeMode: '',
+  isSpeaking: false,
+};
+const nativeTtsIntegrationState = {
+  lastMessageId: null,
+  chatObserver: null,
+  renderTimer: null,
+  domEventsBound: false,
+  contextEventsBound: false,
+  slashCommandRegistered: false,
+  slashCommandObject: null,
+};
+
+function escapeHtmlAttr(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('"', '&quot;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
+
+function coerceNumber(value, fallback) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function getPluginContextSafe() {
+  try {
+    return typeof getContext === 'function' ? getContext() : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function getDefaultTtsApiUrl(provider) {
+  if (provider === 'minimax') return 'https://api.minimax.io/v1/t2a_v2';
+  return '';
+}
+
+function getDefaultTtsModel(provider) {
+  if (provider === 'minimax') return 'speech-2.8-hd';
+  return '';
+}
 
 /**
  * 初始化插件配置
@@ -611,6 +672,8 @@ function initPlugin() {
 
   // 绑定事件监听器
   bindEventListeners();
+  syncTtsFormState();
+  initNativeTtsIntegrations();
 
   // 绑定收缩栏功能
   bindCollapsibleEvents();
@@ -666,6 +729,45 @@ function addPluginStyles() {
     #smart-media-assistant-settings .box-container .flex.flexFlowColumn { gap: 2px; }
     #smart-media-assistant-settings .range-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
     #smart-media-assistant-settings .range-row input[type="range"] { width: 100%; }
+    #smart-media-assistant-settings .sma-stack { align-items: stretch; }
+    #smart-media-assistant-settings .sma-field { width: 100%; box-sizing: border-box; }
+    #smart-media-assistant-settings .sma-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    #smart-media-assistant-settings .sma-grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    #smart-media-assistant-settings .sma-label {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 12px;
+      color: var(--SmartThemeBodyColor, var(--text-secondary, #888));
+    }
+    #smart-media-assistant-settings .sma-help {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--SmartThemeBodyColor, var(--text-secondary, #888));
+      line-height: 1.5;
+    }
+    #smart-media-assistant-settings .sma-button-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    #smart-media-assistant-settings .sma-button-row .menu_button {
+      min-width: 96px;
+    }
+    @media (max-width: 900px) {
+      #smart-media-assistant-settings .sma-grid,
+      #smart-media-assistant-settings .sma-grid-2 {
+        grid-template-columns: 1fr;
+      }
+    }
   `;
   document.head.appendChild(style);
 }
@@ -674,6 +776,17 @@ function addPluginStyles() {
  * 创建设置界面HTML
  */
 function createSettingsHTML() {
+  const ttsProvider = escapeHtmlAttr(pluginConfig.ttsProvider || 'browser');
+  const ttsApiUrl = escapeHtmlAttr(pluginConfig.ttsApiUrl || '');
+  const ttsApiKey = escapeHtmlAttr(pluginConfig.ttsApiKey || '');
+  const ttsModel = escapeHtmlAttr(pluginConfig.ttsModel || '');
+  const ttsVoiceId = escapeHtmlAttr(pluginConfig.ttsVoiceId || '');
+  const ttsFormat = escapeHtmlAttr(pluginConfig.ttsFormat || 'mp3');
+  const ttsSpeed = escapeHtmlAttr(String(coerceNumber(pluginConfig.ttsSpeed, 1)));
+  const ttsVolume = escapeHtmlAttr(String(coerceNumber(pluginConfig.ttsVolume, 1)));
+  const ttsPitch = escapeHtmlAttr(String(coerceNumber(pluginConfig.ttsPitch, 0)));
+  const ttsTestText = escapeHtmlAttr(pluginConfig.ttsTestText || '你好，这是一段 TTS 试听内容。');
+
   // 复用 SillyTavern/JS‑Slash‑Runner 的外观结构
   return `
     <div id="smart-media-assistant" class="extension-root">
@@ -770,6 +883,88 @@ function createSettingsHTML() {
               </div>
             </div>
 
+            <div class="extension-content-item box-container">
+              <div class="flex flexFlowColumn">
+                <div class="settings-title-text">启用 TTS 朗读</div>
+                <div class="settings-title-description">给配套手机页面提供“朗读引用 / 朗读正文”的语音桥接</div>
+              </div>
+              <div class="toggle-switch">
+                <input type="checkbox" id="${MODULE_NAME}_enableTTS" class="toggle-input" ${pluginConfig.enableTTS ? 'checked' : ''} />
+                <label for="${MODULE_NAME}_enableTTS" class="toggle-label"><span class="toggle-handle"></span></label>
+              </div>
+            </div>
+
+            <div class="extension-content-item sma-stack">
+              <div class="flex flexFlowColumn">
+                <div class="settings-title-text">TTS 提供商</div>
+                <select id="${MODULE_NAME}_ttsProvider" class="text_pole sma-field">
+                  <option value="browser" ${ttsProvider === 'browser' ? 'selected' : ''}>浏览器系统语音</option>
+                  <option value="minimax" ${ttsProvider === 'minimax' ? 'selected' : ''}>MiniMax HTTP TTS</option>
+                  <option value="openai-compatible" ${ttsProvider === 'openai-compatible' ? 'selected' : ''}>OpenAI 兼容 TTS</option>
+                </select>
+                <div class="sma-help" id="${MODULE_NAME}_ttsRemoteHint"></div>
+              </div>
+            </div>
+
+            <div class="extension-content-item sma-stack">
+              <div class="flex flexFlowColumn">
+                <div class="settings-title-text">远程 TTS 配置</div>
+                <div class="sma-grid-2">
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsApiUrl">接口地址</label>
+                    <input type="text" id="${MODULE_NAME}_ttsApiUrl" class="text_pole sma-field" value="${ttsApiUrl}" placeholder="例如：https://api.minimax.io/v1/t2a_v2" />
+                  </div>
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsApiKey">API Key</label>
+                    <input type="password" id="${MODULE_NAME}_ttsApiKey" class="text_pole sma-field" value="${ttsApiKey}" placeholder="请输入语音接口密钥" />
+                  </div>
+                </div>
+                <div class="sma-grid">
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsModel">模型</label>
+                    <input type="text" id="${MODULE_NAME}_ttsModel" class="text_pole sma-field" value="${ttsModel}" placeholder="例如：speech-2.8-hd" />
+                  </div>
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsVoiceId">音色 ID / Voice</label>
+                    <input type="text" id="${MODULE_NAME}_ttsVoiceId" class="text_pole sma-field" value="${ttsVoiceId}" placeholder="例如：female-tianmei" />
+                  </div>
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsFormat">音频格式</label>
+                    <select id="${MODULE_NAME}_ttsFormat" class="text_pole sma-field">
+                      <option value="mp3" ${ttsFormat === 'mp3' ? 'selected' : ''}>mp3</option>
+                      <option value="wav" ${ttsFormat === 'wav' ? 'selected' : ''}>wav</option>
+                      <option value="flac" ${ttsFormat === 'flac' ? 'selected' : ''}>flac</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="sma-grid">
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsSpeed">语速</label>
+                    <input type="number" id="${MODULE_NAME}_ttsSpeed" class="text_pole sma-field" value="${ttsSpeed}" step="0.1" />
+                  </div>
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsVolume">音量</label>
+                    <input type="number" id="${MODULE_NAME}_ttsVolume" class="text_pole sma-field" value="${ttsVolume}" step="0.1" />
+                  </div>
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsPitch">音高</label>
+                    <input type="number" id="${MODULE_NAME}_ttsPitch" class="text_pole sma-field" value="${ttsPitch}" step="0.1" />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="extension-content-item sma-stack">
+              <div class="flex flexFlowColumn">
+                <div class="settings-title-text">TTS 试听</div>
+                <input type="text" id="${MODULE_NAME}_ttsTestText" class="text_pole sma-field" value="${ttsTestText}" placeholder="输入一段文本后点击试听" />
+                <div class="sma-button-row">
+                  <button id="${MODULE_NAME}_ttsTestBtn" class="menu_button" type="button">试听</button>
+                  <button id="${MODULE_NAME}_ttsStopBtn" class="menu_button" type="button">停止</button>
+                </div>
+              </div>
+            </div>
+
           </div>
         </div>
       </div>
@@ -847,6 +1042,35 @@ function bindCollapsibleEvents() {
     });
 }
 
+function syncTtsFormState() {
+  const provider = pluginConfig.ttsProvider || 'browser';
+  const isBrowser = provider === 'browser';
+  const remoteSelectors = [
+    `#${MODULE_NAME}_ttsApiUrl`,
+    `#${MODULE_NAME}_ttsApiKey`,
+    `#${MODULE_NAME}_ttsModel`,
+    `#${MODULE_NAME}_ttsVoiceId`,
+    `#${MODULE_NAME}_ttsFormat`,
+    `#${MODULE_NAME}_ttsSpeed`,
+    `#${MODULE_NAME}_ttsVolume`,
+    `#${MODULE_NAME}_ttsPitch`,
+  ];
+
+  remoteSelectors.forEach((selector) => $(selector).prop('disabled', isBrowser || !pluginConfig.enableTTS));
+  $(`#${MODULE_NAME}_ttsTestBtn`).prop('disabled', !pluginConfig.enableTTS);
+  $(`#${MODULE_NAME}_ttsStopBtn`).prop('disabled', !pluginConfig.enableTTS);
+
+  let helpText = '浏览器系统语音不需要接口配置，会直接调用当前设备可用的系统语音。';
+  if (provider === 'minimax') {
+    helpText =
+      'MiniMax 使用官方 HTTP TTS 接口。接口地址可以填写域名，也可以直接填写完整的 /v1/t2a_v2 地址。';
+  } else if (provider === 'openai-compatible') {
+    helpText = 'OpenAI 兼容模式通常填写完整的 /audio/speech 地址，并使用 voice + model 进行合成。';
+  }
+
+  $(`#${MODULE_NAME}_ttsRemoteHint`).text(helpText);
+}
+
 /**
  * 绑定事件监听器
  */
@@ -896,6 +1120,90 @@ function bindEventListeners() {
   $(document).on('change', `#${MODULE_NAME}_enableLogging`, function () {
     pluginConfig.enableLogging = $(this).prop('checked');
     saveSettings();
+  });
+
+  $(document).on('change', `#${MODULE_NAME}_enableTTS`, function () {
+    pluginConfig.enableTTS = $(this).prop('checked');
+    syncTtsFormState();
+    saveSettings();
+  });
+
+  $(document).on('change', `#${MODULE_NAME}_ttsProvider`, function () {
+    pluginConfig.ttsProvider = String($(this).val() || 'browser');
+    if (!pluginConfig.ttsApiUrl) {
+      pluginConfig.ttsApiUrl = getDefaultTtsApiUrl(pluginConfig.ttsProvider);
+      $(`#${MODULE_NAME}_ttsApiUrl`).val(pluginConfig.ttsApiUrl);
+    }
+    if (!pluginConfig.ttsModel) {
+      pluginConfig.ttsModel = getDefaultTtsModel(pluginConfig.ttsProvider);
+      $(`#${MODULE_NAME}_ttsModel`).val(pluginConfig.ttsModel);
+    }
+    syncTtsFormState();
+    saveSettings();
+  });
+
+  $(document).on('input change', `#${MODULE_NAME}_ttsApiUrl`, function () {
+    pluginConfig.ttsApiUrl = String($(this).val() || '').trim();
+    saveSettings();
+  });
+
+  $(document).on('input change', `#${MODULE_NAME}_ttsApiKey`, function () {
+    pluginConfig.ttsApiKey = String($(this).val() || '').trim();
+    saveSettings();
+  });
+
+  $(document).on('input change', `#${MODULE_NAME}_ttsModel`, function () {
+    pluginConfig.ttsModel = String($(this).val() || '').trim();
+    saveSettings();
+  });
+
+  $(document).on('input change', `#${MODULE_NAME}_ttsVoiceId`, function () {
+    pluginConfig.ttsVoiceId = String($(this).val() || '').trim();
+    saveSettings();
+  });
+
+  $(document).on('change', `#${MODULE_NAME}_ttsFormat`, function () {
+    pluginConfig.ttsFormat = String($(this).val() || 'mp3');
+    saveSettings();
+  });
+
+  $(document).on('input change', `#${MODULE_NAME}_ttsSpeed`, function () {
+    pluginConfig.ttsSpeed = coerceNumber($(this).val(), 1);
+    saveSettings();
+  });
+
+  $(document).on('input change', `#${MODULE_NAME}_ttsVolume`, function () {
+    pluginConfig.ttsVolume = coerceNumber($(this).val(), 1);
+    saveSettings();
+  });
+
+  $(document).on('input change', `#${MODULE_NAME}_ttsPitch`, function () {
+    pluginConfig.ttsPitch = coerceNumber($(this).val(), 0);
+    saveSettings();
+  });
+
+  $(document).on('input change', `#${MODULE_NAME}_ttsTestText`, function () {
+    pluginConfig.ttsTestText = String($(this).val() || '');
+    saveSettings();
+  });
+
+  $(document).on('click', `#${MODULE_NAME}_ttsTestBtn`, async function () {
+    try {
+      await speakTextWithConfiguredProvider(pluginConfig.ttsTestText || '你好，这是一段 TTS 试听内容。', {
+        source: 'plugin-test',
+      });
+      if (typeof toastr !== 'undefined') {
+        toastr.success('TTS 已开始播放', '语音朗读');
+      }
+    } catch (error) {
+      if (typeof toastr !== 'undefined') {
+        toastr.error(error.message || String(error), 'TTS 试听失败');
+      }
+    }
+  });
+
+  $(document).on('click', `#${MODULE_NAME}_ttsStopBtn`, function () {
+    stopSpeaking();
   });
 }
 
@@ -976,6 +1284,768 @@ async function processTextBridge(text, options = {}) {
   }
   return await sendTextToSillyTavern(content);
 }
+
+function sanitizeTtsText(text) {
+  return String(text ?? '')
+    .replace(/\r/g, '')
+    .replace(/\u200b/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function ensureTtsAudioElement() {
+  if (ttsPlaybackState.audioElement) return ttsPlaybackState.audioElement;
+  const audio = document.createElement('audio');
+  audio.id = `${MODULE_NAME}-tts-audio`;
+  audio.preload = 'none';
+  audio.style.display = 'none';
+  audio.addEventListener('ended', () => {
+    ttsPlaybackState.isSpeaking = false;
+    ttsPlaybackState.activeMode = '';
+    if (ttsPlaybackState.currentObjectUrl) {
+      URL.revokeObjectURL(ttsPlaybackState.currentObjectUrl);
+      ttsPlaybackState.currentObjectUrl = '';
+    }
+  });
+  audio.addEventListener('error', () => {
+    ttsPlaybackState.isSpeaking = false;
+    ttsPlaybackState.activeMode = '';
+  });
+  document.body.appendChild(audio);
+  ttsPlaybackState.audioElement = audio;
+  return audio;
+}
+
+function stopSpeaking() {
+  try {
+    if (typeof speechSynthesis !== 'undefined') {
+      speechSynthesis.cancel();
+    }
+  } catch (e) {}
+
+  const audio = ttsPlaybackState.audioElement;
+  if (audio) {
+    try {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+    } catch (e) {}
+  }
+
+  if (ttsPlaybackState.currentObjectUrl) {
+    URL.revokeObjectURL(ttsPlaybackState.currentObjectUrl);
+    ttsPlaybackState.currentObjectUrl = '';
+  }
+  ttsPlaybackState.activeMode = '';
+  ttsPlaybackState.isSpeaking = false;
+}
+
+function pickBrowserVoice(keyword) {
+  if (typeof speechSynthesis === 'undefined' || typeof speechSynthesis.getVoices !== 'function') return null;
+  const voices = speechSynthesis.getVoices() || [];
+  const needle = String(keyword || '').trim().toLowerCase();
+  if (needle) {
+    const matched = voices.find((voice) => String(voice.name || '').toLowerCase().includes(needle));
+    if (matched) return matched;
+  }
+  return voices.find((voice) => String(voice.lang || '').toLowerCase().startsWith('zh')) || voices[0] || null;
+}
+
+function playViaBrowserSpeech(text) {
+  if (typeof speechSynthesis === 'undefined' || typeof SpeechSynthesisUtterance === 'undefined') {
+    throw new Error('当前浏览器不支持 speechSynthesis');
+  }
+
+  stopSpeaking();
+  const utterance = new SpeechSynthesisUtterance(text);
+  const voice = pickBrowserVoice(pluginConfig.ttsVoiceId);
+  if (voice) utterance.voice = voice;
+  utterance.rate = clamp(coerceNumber(pluginConfig.ttsSpeed, 1), 0.1, 10);
+  utterance.volume = clamp(coerceNumber(pluginConfig.ttsVolume, 1), 0, 1);
+  utterance.pitch = clamp(1 + coerceNumber(pluginConfig.ttsPitch, 0) * 0.1, 0, 2);
+  utterance.onstart = () => {
+    ttsPlaybackState.activeMode = 'browser';
+    ttsPlaybackState.isSpeaking = true;
+  };
+  utterance.onend = () => {
+    ttsPlaybackState.activeMode = '';
+    ttsPlaybackState.isSpeaking = false;
+  };
+  utterance.onerror = () => {
+    ttsPlaybackState.activeMode = '';
+    ttsPlaybackState.isSpeaking = false;
+  };
+  speechSynthesis.speak(utterance);
+}
+
+function normalizeMiniMaxTtsUrl(rawUrl) {
+  const value = String(rawUrl || '').trim();
+  const fallback = 'https://api.minimax.io/v1/t2a_v2';
+  if (!value) return fallback;
+  if (/\/v1\/t2a_v2\/?$/i.test(value)) return value;
+  return `${value.replace(/\/+$/, '')}/v1/t2a_v2`;
+}
+
+function hexToBlobUrl(hex, format = 'mp3') {
+  const cleanHex = String(hex || '').replace(/\s+/g, '');
+  if (!cleanHex) {
+    throw new Error('语音接口未返回音频数据');
+  }
+  if (cleanHex.length % 2 !== 0) {
+    throw new Error('返回的十六进制音频长度不合法');
+  }
+
+  const bytes = new Uint8Array(cleanHex.length / 2);
+  for (let i = 0; i < cleanHex.length; i += 2) {
+    bytes[i / 2] = parseInt(cleanHex.slice(i, i + 2), 16);
+  }
+
+  const mimeMap = {
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    flac: 'audio/flac',
+  };
+  const blob = new Blob([bytes], { type: mimeMap[format] || 'audio/mpeg' });
+  return URL.createObjectURL(blob);
+}
+
+async function parseRemoteError(response, fallbackMessage) {
+  const rawText = await response.text();
+  if (!rawText) return `${fallbackMessage}: ${response.status} ${response.statusText}`;
+
+  try {
+    const json = JSON.parse(rawText);
+    const message =
+      json?.base_resp?.status_msg ||
+      json?.error?.message ||
+      json?.message ||
+      json?.msg ||
+      rawText;
+    return `${fallbackMessage}: ${message}`;
+  } catch (e) {
+    return `${fallbackMessage}: ${rawText}`;
+  }
+}
+
+async function synthesizeMiniMaxSpeech(text) {
+  const apiKey = String(pluginConfig.ttsApiKey || '').trim();
+  const voiceId = String(pluginConfig.ttsVoiceId || '').trim();
+  if (!apiKey) throw new Error('请先填写 MiniMax API Key');
+  if (!voiceId) throw new Error('请先填写 MiniMax 音色 ID');
+
+  const response = await fetch(normalizeMiniMaxTtsUrl(pluginConfig.ttsApiUrl), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: String(pluginConfig.ttsModel || '').trim() || 'speech-2.8-hd',
+      text,
+      stream: false,
+      language_boost: 'auto',
+      output_format: 'hex',
+      voice_setting: {
+        voice_id: voiceId,
+        speed: coerceNumber(pluginConfig.ttsSpeed, 1),
+        vol: coerceNumber(pluginConfig.ttsVolume, 1),
+        pitch: coerceNumber(pluginConfig.ttsPitch, 0),
+      },
+      audio_setting: {
+        sample_rate: 32000,
+        bitrate: 128000,
+        format: String(pluginConfig.ttsFormat || 'mp3').trim() || 'mp3',
+        channel: 1,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await parseRemoteError(response, 'MiniMax TTS 请求失败，请检查地址、密钥或是否存在跨域限制'),
+    );
+  }
+
+  const data = await response.json();
+  const statusCode = data?.base_resp?.status_code;
+  if (Number.isFinite(statusCode) && statusCode !== 0) {
+    throw new Error(data?.base_resp?.status_msg || 'MiniMax TTS 返回错误');
+  }
+
+  return {
+    url: hexToBlobUrl(data?.data?.audio, pluginConfig.ttsFormat || 'mp3'),
+    revokeAfterUse: true,
+  };
+}
+
+async function synthesizeOpenAICompatibleSpeech(text) {
+  const apiUrl = String(pluginConfig.ttsApiUrl || '').trim();
+  const apiKey = String(pluginConfig.ttsApiKey || '').trim();
+  const model = String(pluginConfig.ttsModel || '').trim();
+  const voiceId = String(pluginConfig.ttsVoiceId || '').trim();
+  if (!apiUrl) throw new Error('请先填写 OpenAI 兼容 TTS 接口地址');
+  if (!apiKey) throw new Error('请先填写 OpenAI 兼容 TTS 的 API Key');
+  if (!model) throw new Error('请先填写 OpenAI 兼容 TTS 的模型名');
+  if (!voiceId) throw new Error('请先填写 OpenAI 兼容 TTS 的 voice');
+
+  const response = await fetch(apiUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      voice: voiceId,
+      input: text,
+      response_format: String(pluginConfig.ttsFormat || 'mp3').trim() || 'mp3',
+      speed: coerceNumber(pluginConfig.ttsSpeed, 1),
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await parseRemoteError(response, 'OpenAI 兼容 TTS 请求失败，请检查地址、密钥或返回格式'),
+    );
+  }
+
+  const blob = await response.blob();
+  if (!blob || !blob.size) {
+    throw new Error('OpenAI 兼容 TTS 未返回音频数据');
+  }
+
+  return {
+    url: URL.createObjectURL(blob),
+    revokeAfterUse: true,
+  };
+}
+
+async function playRemoteTtsAudio(source) {
+  const audio = ensureTtsAudioElement();
+  stopSpeaking();
+  if (source.revokeAfterUse) {
+    ttsPlaybackState.currentObjectUrl = source.url;
+  }
+  audio.src = source.url;
+  audio.currentTime = 0;
+  ttsPlaybackState.activeMode = 'audio';
+  ttsPlaybackState.isSpeaking = true;
+  try {
+    await audio.play();
+  } catch (error) {
+    if (ttsPlaybackState.currentObjectUrl) {
+      URL.revokeObjectURL(ttsPlaybackState.currentObjectUrl);
+      ttsPlaybackState.currentObjectUrl = '';
+    }
+    ttsPlaybackState.activeMode = '';
+    ttsPlaybackState.isSpeaking = false;
+    throw error;
+  }
+}
+
+async function speakTextWithConfiguredProvider(text, options = {}) {
+  if (!pluginConfig.enableTTS) {
+    throw new Error('TTS 功能已关闭，请先在插件设置中开启');
+  }
+
+  const cleanText = sanitizeTtsText(text);
+  if (!cleanText) {
+    throw new Error('没有可用于朗读的文本');
+  }
+
+  const provider = options.provider || pluginConfig.ttsProvider || 'browser';
+  if (pluginConfig.enableLogging) {
+    console.log('[Smart Media Assistant] TTS 开始朗读', {
+      provider,
+      length: cleanText.length,
+      source: options?.source || 'unknown',
+    });
+  }
+
+  if (provider === 'browser') {
+    playViaBrowserSpeech(cleanText);
+    return { success: true, provider, mode: 'browser' };
+  }
+
+  const source =
+    provider === 'minimax'
+      ? await synthesizeMiniMaxSpeech(cleanText)
+      : await synthesizeOpenAICompatibleSpeech(cleanText);
+
+  await playRemoteTtsAudio(source);
+  return { success: true, provider, mode: 'audio' };
+}
+
+function getTtsStatus() {
+  const speechActive =
+    typeof speechSynthesis !== 'undefined' &&
+    (speechSynthesis.speaking || speechSynthesis.pending || speechSynthesis.paused);
+
+  return {
+    enabled: !!pluginConfig.enableTTS,
+    provider: pluginConfig.ttsProvider || 'browser',
+    isSpeaking: !!ttsPlaybackState.isSpeaking || !!speechActive,
+    activeMode: ttsPlaybackState.activeMode || (speechActive ? 'browser' : ''),
+  };
+}
+
+function showTtsToast(message, level = 'info') {
+  if (typeof toastr === 'undefined') return;
+  if (level === 'error') {
+    toastr.error(message, 'TTS');
+    return;
+  }
+  if (level === 'success') {
+    toastr.success(message, 'TTS');
+    return;
+  }
+  toastr.info(message, 'TTS');
+}
+
+function normalizeMessageId(value) {
+  const num = Number(value);
+  return Number.isInteger(num) && num >= 0 ? num : null;
+}
+
+function rememberNativeTtsMessageId(messageId) {
+  const normalizedId = normalizeMessageId(messageId);
+  if (normalizedId !== null) {
+    nativeTtsIntegrationState.lastMessageId = normalizedId;
+  }
+  return normalizedId;
+}
+
+function getChatMessageById(messageId) {
+  const context = getPluginContextSafe();
+  const chat = Array.isArray(context?.chat) ? context.chat : [];
+  const normalizedId = normalizeMessageId(messageId);
+  if (normalizedId === null || normalizedId >= chat.length) return null;
+  return chat[normalizedId] || null;
+}
+
+function stripHtmlToText(html) {
+  if (typeof document === 'undefined') return String(html ?? '');
+  const div = document.createElement('div');
+  div.innerHTML = String(html ?? '');
+  return div.textContent || div.innerText || '';
+}
+
+function getRawChatMessageText(message) {
+  if (!message) return '';
+  let text = message?.extra?.display_text ?? message?.mes ?? '';
+  text = String(text ?? '');
+  if (!text) return '';
+  if (/<[a-z][\s\S]*>/i.test(text)) {
+    text = stripHtmlToText(text);
+  }
+  return sanitizeTtsText(text);
+}
+
+function getRenderedChatMessageText(messageId) {
+  if (typeof document === 'undefined') return '';
+  const normalizedId = normalizeMessageId(messageId);
+  if (normalizedId === null) return '';
+  const textElement = document.querySelector(`#chat .mes[mesid="${normalizedId}"] .mes_text`);
+  if (!textElement) return '';
+
+  const clone = textElement.cloneNode(true);
+  if (clone.querySelectorAll) {
+    clone.querySelectorAll('script, style').forEach((node) => node.remove());
+  }
+
+  return sanitizeTtsText(clone.textContent || clone.innerText || '');
+}
+
+function getChatMessageContentText(messageId) {
+  const rendered = getRenderedChatMessageText(messageId);
+  if (rendered && rendered !== '...') return rendered;
+
+  const message = getChatMessageById(messageId);
+  const raw = getRawChatMessageText(message);
+  return raw !== '...' ? raw : '';
+}
+
+function joinQuotedBlocks(text, options = {}) {
+  const {
+    separator = ' ... ',
+    includeQuotes = false,
+    returnEmptyOnNoQuotes = false,
+    pairs = [
+      ['„', '“'],
+      ['“', '”'],
+      ['«', '»'],
+      ['»', '«'],
+      ['‘', '’'],
+      ['‚', '‘'],
+      ['「', '」'],
+      ['『', '』'],
+      ['"', '"'],
+      ['＂', '＂'],
+    ],
+  } = options;
+
+  if (!text || typeof text !== 'string') return text;
+
+  const openToClose = Object.fromEntries(pairs);
+  const segments = [];
+  const stack = [];
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    const top = stack[stack.length - 1];
+
+    if (top && char === top.expectedClose) {
+      const finished = stack.pop();
+      if (stack.length === 0) {
+        segments.push(text.slice(finished.start, i + 1));
+      }
+      continue;
+    }
+
+    if (openToClose[char]) {
+      stack.push({ opener: char, expectedClose: openToClose[char], start: i });
+    }
+  }
+
+  if (!segments.length) return returnEmptyOnNoQuotes ? '' : text;
+  const cleaned = includeQuotes ? segments : segments.map((segment) => segment.slice(1, -1));
+  return cleaned.join(separator);
+}
+
+function getChatMessageQuotedText(messageId) {
+  const text = getChatMessageContentText(messageId);
+  if (!text) return '';
+  return sanitizeTtsText(
+    joinQuotedBlocks(text, {
+      separator: ' ... ',
+      includeQuotes: false,
+      returnEmptyOnNoQuotes: true,
+    }),
+  );
+}
+
+function isNarratableChatMessage(message) {
+  if (!message || message.is_system) return false;
+  const content = getRawChatMessageText(message);
+  return !!content && content !== '...';
+}
+
+function getLatestNarratableMessageId() {
+  const context = getPluginContextSafe();
+  const chat = Array.isArray(context?.chat) ? context.chat : [];
+  for (let index = chat.length - 1; index >= 0; index -= 1) {
+    if (!isNarratableChatMessage(chat[index])) continue;
+    return index;
+  }
+  return null;
+}
+
+function resolveTargetMessageId(preferredId = null) {
+  const explicitId = normalizeMessageId(preferredId);
+  if (explicitId !== null && getChatMessageById(explicitId)) {
+    return explicitId;
+  }
+
+  const rememberedId = normalizeMessageId(nativeTtsIntegrationState.lastMessageId);
+  if (rememberedId !== null && getChatMessageById(rememberedId)) {
+    return rememberedId;
+  }
+
+  return getLatestNarratableMessageId();
+}
+
+async function speakChatMessageById(messageId, mode = 'content', options = {}) {
+  const resolvedId = resolveTargetMessageId(messageId);
+  if (resolvedId === null) {
+    throw new Error('未找到可朗读的消息');
+  }
+
+  rememberNativeTtsMessageId(resolvedId);
+  const text =
+    mode === 'quote' ? getChatMessageQuotedText(resolvedId) : getChatMessageContentText(resolvedId);
+
+  if (!text) {
+    throw new Error(mode === 'quote' ? '这条消息里没有双引号内容' : '这条消息没有可朗读的正文');
+  }
+
+  return await speakTextWithConfiguredProvider(text, {
+    ...options,
+    source: options?.source || `st-chat-${mode}`,
+    messageId: resolvedId,
+    mode,
+  });
+}
+
+function createNativeTtsActionButton(action, title, iconClass) {
+  return $(`
+    <div
+      title="${escapeHtmlAttr(title)}"
+      class="mes_button sma_tts_action ${escapeHtmlAttr(iconClass)}"
+      data-sma-tts-action="${escapeHtmlAttr(action)}"
+    ></div>
+  `);
+}
+
+function renderNativeTtsButtons() {
+  if (typeof document === 'undefined' || typeof $ !== 'function') return;
+
+  $('#chat .mes').each(function () {
+    const $message = $(this);
+    const messageId = normalizeMessageId($message.attr('mesid'));
+    if (messageId === null) return;
+    const chatMessage = getChatMessageById(messageId);
+    if (!chatMessage || chatMessage.is_system) return;
+
+    const $container = $message.find('.extraMesButtons').first();
+    if ($container.length === 0) return;
+
+    if ($container.find('[data-sma-tts-action="content"]').length === 0) {
+      createNativeTtsActionButton('content', '朗读正文', 'fa-solid fa-bullhorn').appendTo($container);
+    }
+    if ($container.find('[data-sma-tts-action="quote"]').length === 0) {
+      createNativeTtsActionButton('quote', '朗读双引号内容', 'fa-solid fa-quote-right').appendTo($container);
+    }
+    if ($container.find('[data-sma-tts-action="stop"]').length === 0) {
+      createNativeTtsActionButton('stop', '停止朗读', 'fa-solid fa-stop').appendTo($container);
+    }
+  });
+}
+
+function queueNativeTtsButtonsRefresh(delay = 0) {
+  if (nativeTtsIntegrationState.renderTimer) {
+    clearTimeout(nativeTtsIntegrationState.renderTimer);
+  }
+  nativeTtsIntegrationState.renderTimer = setTimeout(() => {
+    nativeTtsIntegrationState.renderTimer = null;
+    renderNativeTtsButtons();
+  }, delay);
+}
+
+function closeNativeTtsActions(triggerElement) {
+  const $buttons = $(triggerElement).closest('.extraMesButtons');
+  if ($buttons.length === 0) return;
+
+  $buttons.hide().removeClass('visible').css('opacity', '');
+  $buttons.siblings('.extraMesButtonsHint').show().css('opacity', '');
+}
+
+function bindNativeTtsMenuEvents() {
+  if (nativeTtsIntegrationState.domEventsBound || typeof $ !== 'function') return;
+  nativeTtsIntegrationState.domEventsBound = true;
+
+  $(document).off('.smaTtsNative');
+
+  $(document).on('click.smaTtsNative', '.extraMesButtonsHint', function () {
+    rememberNativeTtsMessageId($(this).closest('.mes').attr('mesid'));
+  });
+
+  $(document).on('click.smaTtsNative', '[data-sma-tts-action]', async function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const $target = $(this);
+    const action = String($target.attr('data-sma-tts-action') || '').trim();
+    const messageId = rememberNativeTtsMessageId($target.closest('.mes').attr('mesid'));
+
+    closeNativeTtsActions(this);
+
+    try {
+      if (action === 'stop') {
+        stopSpeaking();
+        showTtsToast('已停止朗读');
+        return;
+      }
+
+      if (action === 'quote') {
+        await speakChatMessageById(messageId, 'quote', { source: 'st-native-menu' });
+        showTtsToast('开始朗读双引号内容', 'success');
+        return;
+      }
+
+      await speakChatMessageById(messageId, 'content', { source: 'st-native-menu' });
+      showTtsToast('开始朗读消息正文', 'success');
+    } catch (error) {
+      showTtsToast(error.message || String(error), 'error');
+    }
+  });
+}
+
+function bindNativeTtsContextEvents() {
+  if (nativeTtsIntegrationState.contextEventsBound) return;
+  const context = getPluginContextSafe();
+  if (!context?.eventSource || !context?.eventTypes) return;
+
+  nativeTtsIntegrationState.contextEventsBound = true;
+  const refresh = () => queueNativeTtsButtonsRefresh(0);
+  const events = [
+    context.eventTypes.CHAT_CHANGED,
+    context.eventTypes.MESSAGE_RECEIVED,
+    context.eventTypes.MESSAGE_UPDATED,
+    context.eventTypes.MESSAGE_EDITED,
+    context.eventTypes.MESSAGE_SWIPED,
+  ].filter(Boolean);
+
+  events.forEach((eventName) => context.eventSource.on(eventName, refresh));
+}
+
+function observeNativeChatDom() {
+  if (nativeTtsIntegrationState.chatObserver || typeof MutationObserver === 'undefined') return;
+  const chatNode = document.getElementById('chat');
+  if (!chatNode) return;
+
+  nativeTtsIntegrationState.chatObserver = new MutationObserver(() => {
+    queueNativeTtsButtonsRefresh(10);
+  });
+  nativeTtsIntegrationState.chatObserver.observe(chatNode, {
+    childList: true,
+    subtree: true,
+  });
+}
+
+function normalizeTtsSlashMode(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '';
+
+  const contentModes = ['当前消息', '当前', '正文', '内容', 'message', 'current', 'latest', 'last', 'content', 'text'];
+  if (contentModes.includes(normalized)) return 'content';
+
+  const quoteModes = ['引号', '双引号', 'quote', 'quotes', 'quoted', 'dialogue', 'dialog'];
+  if (quoteModes.includes(normalized)) return 'quote';
+
+  const stopModes = ['停止', '停止朗读', 'stop', 'end', 'cancel'];
+  if (stopModes.includes(normalized)) return 'stop';
+
+  return '';
+}
+
+async function handleTtsSlashCommand(args = {}, value = '') {
+  const modeFromArgs = normalizeTtsSlashMode(args?.mode);
+  const rawValue = sanitizeTtsText(value);
+  const explicitMessageId = normalizeMessageId(args?.id);
+
+  try {
+    if (modeFromArgs === 'stop') {
+      stopSpeaking();
+      showTtsToast('已停止朗读');
+      return '';
+    }
+
+    if (modeFromArgs === 'content' || modeFromArgs === 'quote') {
+      await speakChatMessageById(explicitMessageId, modeFromArgs, { source: 'slash-tts' });
+      showTtsToast(modeFromArgs === 'quote' ? '开始朗读双引号内容' : '开始朗读消息正文', 'success');
+      return '';
+    }
+
+    const inlineMode = normalizeTtsSlashMode(rawValue);
+    if (inlineMode === 'stop') {
+      stopSpeaking();
+      showTtsToast('已停止朗读');
+      return '';
+    }
+
+    if (inlineMode === 'content' || inlineMode === 'quote') {
+      await speakChatMessageById(explicitMessageId, inlineMode, { source: 'slash-tts' });
+      showTtsToast(inlineMode === 'quote' ? '开始朗读双引号内容' : '开始朗读消息正文', 'success');
+      return '';
+    }
+
+    if (rawValue) {
+      await speakTextWithConfiguredProvider(rawValue, { source: 'slash-tts-direct' });
+      showTtsToast('开始朗读文本内容', 'success');
+      return '';
+    }
+
+    await speakChatMessageById(explicitMessageId, 'content', { source: 'slash-tts' });
+    showTtsToast('开始朗读消息正文', 'success');
+    return '';
+  } catch (error) {
+    showTtsToast(error.message || String(error), 'error');
+    return '';
+  }
+}
+
+function createTtsSlashCommand() {
+  const context = getPluginContextSafe();
+  if (!context?.SlashCommand || !context?.ARGUMENT_TYPE) return null;
+
+  const SlashCommand = context.SlashCommand;
+  const SlashCommandArgument = context.SlashCommandArgument;
+  const SlashCommandNamedArgument = context.SlashCommandNamedArgument;
+  const ARGUMENT_TYPE = context.ARGUMENT_TYPE;
+
+  return SlashCommand.fromProps({
+    name: 'tts',
+    aliases: ['smart-tts', 'sma-tts'],
+    callback: async (args, rawValue) => await handleTtsSlashCommand(args, rawValue),
+    namedArgumentList: [
+      SlashCommandNamedArgument.fromProps({
+        name: 'mode',
+        description: '可选：当前消息 / 引号 / 停止',
+        typeList: [ARGUMENT_TYPE.STRING],
+        isRequired: false,
+      }),
+      SlashCommandNamedArgument.fromProps({
+        name: 'id',
+        description: '可选：指定消息 ID；不填时优先使用最近打开过菜单的消息，否则回退到最后一条可朗读消息',
+        typeList: [ARGUMENT_TYPE.NUMBER],
+        isRequired: false,
+      }),
+    ],
+    unnamedArgumentList: [
+      SlashCommandArgument.fromProps({
+        description: '模式关键字，或要直接朗读的任意文本',
+        typeList: [ARGUMENT_TYPE.STRING],
+        isRequired: false,
+      }),
+    ],
+    helpString: `
+      <div>朗读当前聊天里的消息正文、双引号内容，或直接朗读传入文本。</div>
+      <div><strong>示例：</strong></div>
+      <ul>
+        <li><pre><code>/tts 当前消息</code></pre></li>
+        <li><pre><code>/tts 引号</code></pre></li>
+        <li><pre><code>/tts mode=quote id=12</code></pre></li>
+        <li><pre><code>/tts 你好，今天过得怎么样？</code></pre></li>
+        <li><pre><code>/tts 停止</code></pre></li>
+      </ul>
+      <div>说明：SillyTavern 自带的 <code>/speak</code> 仍然保留；这里只是把 <code>/tts</code> 别名重定向到本插件。</div>
+    `,
+  });
+}
+
+function installTtsSlashCommand(forceAlias = false) {
+  const context = getPluginContextSafe();
+  if (!context?.SlashCommandParser) return;
+
+  if (!nativeTtsIntegrationState.slashCommandObject) {
+    nativeTtsIntegrationState.slashCommandObject = createTtsSlashCommand();
+  }
+
+  const command = nativeTtsIntegrationState.slashCommandObject;
+  if (!command) return;
+
+  if (!nativeTtsIntegrationState.slashCommandRegistered) {
+    context.SlashCommandParser.addCommandObject(command);
+    nativeTtsIntegrationState.slashCommandRegistered = true;
+  }
+
+  if (forceAlias || context.SlashCommandParser.commands?.tts !== command) {
+    context.SlashCommandParser.commands[command.name] = command;
+    for (const alias of command.aliases || []) {
+      context.SlashCommandParser.commands[alias] = command;
+    }
+  }
+}
+
+function initNativeTtsIntegrations() {
+  bindNativeTtsMenuEvents();
+  bindNativeTtsContextEvents();
+  observeNativeChatDom();
+  queueNativeTtsButtonsRefresh(0);
+  installTtsSlashCommand(true);
+  setTimeout(() => installTtsSlashCommand(true), 1000);
+}
+
 function exposeGlobalBridge() {
   try {
     const target = typeof window !== 'undefined' ? window : globalThis;
@@ -986,6 +2056,11 @@ function exposeGlobalBridge() {
         console.log('[Smart Media Assistant] 已暴露桥接: smartMediaAssistant.processText');
       }
     }
+    target.smartMediaAssistant.speakText = (text, options) => speakTextWithConfiguredProvider(text, options);
+    target.smartMediaAssistant.speakChatMessageById = (messageId, mode, options) =>
+      speakChatMessageById(messageId, mode, options);
+    target.smartMediaAssistant.stopSpeaking = () => stopSpeaking();
+    target.smartMediaAssistant.getTtsStatus = () => getTtsStatus();
   } catch (e) {
     console.warn('[Smart Media Assistant] 暴露全局桥接失败', e);
   }
