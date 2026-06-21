@@ -30,6 +30,8 @@ const DEFAULT_CONFIG = {
   ttsModel: '',
   ttsVoiceId: '',
   ttsFormat: 'mp3',
+  ttsGroupId: '',
+  ttsMiniMaxHost: 'official',
   ttsSpeed: 1,
   ttsVolume: 1,
   ttsPitch: 0,
@@ -113,8 +115,18 @@ function getPluginContextSafe() {
   }
 }
 
+function getMiniMaxApiHostByKey(hostKey) {
+  const key = String(hostKey || '').trim().toLowerCase();
+  const hostMap = {
+    official: 'https://api.minimax.io',
+    global: 'https://api.minimaxi.chat',
+    mainland: 'https://api.minimax.chat',
+  };
+  return hostMap[key] || hostMap.official;
+}
+
 function getDefaultTtsApiUrl(provider) {
-  if (provider === 'minimax') return 'https://api.minimax.io/v1/t2a_v2';
+  if (provider === 'minimax') return `${getMiniMaxApiHostByKey(pluginConfig.ttsMiniMaxHost)}/v1/t2a_v2`;
   return '';
 }
 
@@ -136,6 +148,9 @@ function initConfig() {
 
   // 合并默认配置和用户配置
   pluginConfig = { ...DEFAULT_CONFIG, ...extensionSettings };
+  if (pluginConfig.ttsProvider === 'minimax' && !String(pluginConfig.ttsApiUrl || '').trim()) {
+    pluginConfig.ttsApiUrl = getDefaultTtsApiUrl('minimax');
+  }
 
   // 保存到全局设置
   context.extensionSettings[MODULE_NAME] = pluginConfig;
@@ -782,6 +797,8 @@ function createSettingsHTML() {
   const ttsModel = escapeHtmlAttr(pluginConfig.ttsModel || '');
   const ttsVoiceId = escapeHtmlAttr(pluginConfig.ttsVoiceId || '');
   const ttsFormat = escapeHtmlAttr(pluginConfig.ttsFormat || 'mp3');
+  const ttsGroupId = escapeHtmlAttr(pluginConfig.ttsGroupId || '');
+  const ttsMiniMaxHost = escapeHtmlAttr(pluginConfig.ttsMiniMaxHost || 'official');
   const ttsSpeed = escapeHtmlAttr(String(coerceNumber(pluginConfig.ttsSpeed, 1)));
   const ttsVolume = escapeHtmlAttr(String(coerceNumber(pluginConfig.ttsVolume, 1)));
   const ttsPitch = escapeHtmlAttr(String(coerceNumber(pluginConfig.ttsPitch, 0)));
@@ -909,6 +926,20 @@ function createSettingsHTML() {
             <div class="extension-content-item sma-stack">
               <div class="flex flexFlowColumn">
                 <div class="settings-title-text">远程 TTS 配置</div>
+                <div class="sma-grid-2">
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsMiniMaxHost">MiniMax 源</label>
+                    <select id="${MODULE_NAME}_ttsMiniMaxHost" class="text_pole sma-field">
+                      <option value="official" ${ttsMiniMaxHost === 'official' ? 'selected' : ''}>Official / 海外默认</option>
+                      <option value="global" ${ttsMiniMaxHost === 'global' ? 'selected' : ''}>Global / minimaxi.chat</option>
+                      <option value="mainland" ${ttsMiniMaxHost === 'mainland' ? 'selected' : ''}>Mainland China / 国内</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="sma-label" for="${MODULE_NAME}_ttsGroupId">MiniMax Group ID</label>
+                    <input type="text" id="${MODULE_NAME}_ttsGroupId" class="text_pole sma-field" value="${ttsGroupId}" placeholder="请输入 Group ID" />
+                  </div>
+                </div>
                 <div class="sma-grid-2">
                   <div>
                     <label class="sma-label" for="${MODULE_NAME}_ttsApiUrl">接口地址</label>
@@ -1045,6 +1076,7 @@ function bindCollapsibleEvents() {
 function syncTtsFormState() {
   const provider = pluginConfig.ttsProvider || 'browser';
   const isBrowser = provider === 'browser';
+  const isMiniMax = provider === 'minimax';
   const remoteSelectors = [
     `#${MODULE_NAME}_ttsApiUrl`,
     `#${MODULE_NAME}_ttsApiKey`,
@@ -1057,13 +1089,15 @@ function syncTtsFormState() {
   ];
 
   remoteSelectors.forEach((selector) => $(selector).prop('disabled', isBrowser || !pluginConfig.enableTTS));
+  $(`#${MODULE_NAME}_ttsMiniMaxHost`).prop('disabled', !isMiniMax || !pluginConfig.enableTTS);
+  $(`#${MODULE_NAME}_ttsGroupId`).prop('disabled', !isMiniMax || !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsTestBtn`).prop('disabled', !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsStopBtn`).prop('disabled', !pluginConfig.enableTTS);
 
   let helpText = '浏览器系统语音不需要接口配置，会直接调用当前设备可用的系统语音。';
   if (provider === 'minimax') {
     helpText =
-      'MiniMax 使用官方 HTTP TTS 接口。接口地址可以填写域名，也可以直接填写完整的 /v1/t2a_v2 地址。';
+      'MiniMax 需要 API Key 和 Group ID；可在 Official / Global / Mainland China 之间切换源，接口地址也可以手动覆盖。';
   } else if (provider === 'openai-compatible') {
     helpText = 'OpenAI 兼容模式通常填写完整的 /audio/speech 地址，并使用 voice + model 进行合成。';
   }
@@ -1130,7 +1164,14 @@ function bindEventListeners() {
 
   $(document).on('change', `#${MODULE_NAME}_ttsProvider`, function () {
     pluginConfig.ttsProvider = String($(this).val() || 'browser');
-    if (!pluginConfig.ttsApiUrl) {
+    const currentApiUrl = String(pluginConfig.ttsApiUrl || '').trim();
+    if (
+      pluginConfig.ttsProvider === 'minimax' &&
+      (!currentApiUrl || /\/audio\/speech/i.test(currentApiUrl) || !/minimax/i.test(currentApiUrl))
+    ) {
+      pluginConfig.ttsApiUrl = getDefaultTtsApiUrl(pluginConfig.ttsProvider);
+      $(`#${MODULE_NAME}_ttsApiUrl`).val(pluginConfig.ttsApiUrl);
+    } else if (!pluginConfig.ttsApiUrl) {
       pluginConfig.ttsApiUrl = getDefaultTtsApiUrl(pluginConfig.ttsProvider);
       $(`#${MODULE_NAME}_ttsApiUrl`).val(pluginConfig.ttsApiUrl);
     }
@@ -1139,6 +1180,20 @@ function bindEventListeners() {
       $(`#${MODULE_NAME}_ttsModel`).val(pluginConfig.ttsModel);
     }
     syncTtsFormState();
+    saveSettings();
+  });
+
+  $(document).on('change', `#${MODULE_NAME}_ttsMiniMaxHost`, function () {
+    pluginConfig.ttsMiniMaxHost = String($(this).val() || 'official');
+    if (pluginConfig.ttsProvider === 'minimax') {
+      pluginConfig.ttsApiUrl = `${getMiniMaxApiHostByKey(pluginConfig.ttsMiniMaxHost)}/v1/t2a_v2`;
+      $(`#${MODULE_NAME}_ttsApiUrl`).val(pluginConfig.ttsApiUrl);
+    }
+    saveSettings();
+  });
+
+  $(document).on('input change', `#${MODULE_NAME}_ttsGroupId`, function () {
+    pluginConfig.ttsGroupId = String($(this).val() || '').trim();
     saveSettings();
   });
 
@@ -1378,12 +1433,27 @@ function playViaBrowserSpeech(text) {
   speechSynthesis.speak(utterance);
 }
 
-function normalizeMiniMaxTtsUrl(rawUrl) {
+function buildMiniMaxTtsUrl(rawUrl, groupId) {
   const value = String(rawUrl || '').trim();
-  const fallback = 'https://api.minimax.io/v1/t2a_v2';
-  if (!value) return fallback;
-  if (/\/v1\/t2a_v2\/?$/i.test(value)) return value;
-  return `${value.replace(/\/+$/, '')}/v1/t2a_v2`;
+  const sourceBase = getMiniMaxApiHostByKey(pluginConfig.ttsMiniMaxHost);
+  const fallback = `${sourceBase}/v1/t2a_v2`;
+  const inputUrl = value || fallback;
+  const endpointUrl = /\/v1\/t2a_v2(?:[/?]|$)/i.test(inputUrl)
+    ? inputUrl
+    : `${inputUrl.replace(/\/+$/, '')}/v1/t2a_v2`;
+
+  let url;
+  try {
+    const baseOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://api.minimax.io';
+    url = new URL(endpointUrl, baseOrigin);
+  } catch (error) {
+    throw new Error('MiniMax 接口地址格式不正确');
+  }
+
+  if (groupId) {
+    url.searchParams.set('GroupId', groupId);
+  }
+  return url.toString();
 }
 
 function hexToBlobUrl(hex, format = 'mp3') {
@@ -1429,15 +1499,18 @@ async function parseRemoteError(response, fallbackMessage) {
 
 async function synthesizeMiniMaxSpeech(text) {
   const apiKey = String(pluginConfig.ttsApiKey || '').trim();
+  const groupId = String(pluginConfig.ttsGroupId || '').trim();
   const voiceId = String(pluginConfig.ttsVoiceId || '').trim();
   if (!apiKey) throw new Error('请先填写 MiniMax API Key');
+  if (!groupId) throw new Error('请先填写 MiniMax Group ID');
   if (!voiceId) throw new Error('请先填写 MiniMax 音色 ID');
 
-  const response = await fetch(normalizeMiniMaxTtsUrl(pluginConfig.ttsApiUrl), {
+  const response = await fetch(buildMiniMaxTtsUrl(pluginConfig.ttsApiUrl, groupId), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
+      'MM-API-Source': 'SillyTavern-TTS',
     },
     body: JSON.stringify({
       model: String(pluginConfig.ttsModel || '').trim() || 'speech-2.8-hd',
