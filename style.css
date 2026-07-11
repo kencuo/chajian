@@ -439,6 +439,104 @@
     opacity 0.15s ease;
 }
 
+#smart-media-assistant-settings .sma-tts-cache-library {
+  min-width: 0;
+}
+
+#smart-media-assistant-settings .sma-tts-cache-heading,
+#smart-media-assistant-settings .sma-tts-cache-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+#smart-media-assistant-settings .sma-tts-cache-toolbar {
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+#smart-media-assistant-settings .sma-tts-cache-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+#smart-media-assistant-settings .sma-tts-cache-list {
+  max-height: 360px;
+  margin-top: 8px;
+  overflow-y: auto;
+  border-top: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.35));
+}
+
+#smart-media-assistant-settings .sma-tts-cache-item {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 54px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.35));
+}
+
+#smart-media-assistant-settings .sma-tts-cache-checkbox {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
+#smart-media-assistant-settings .sma-tts-cache-info {
+  min-width: 0;
+}
+
+#smart-media-assistant-settings .sma-tts-cache-text {
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#smart-media-assistant-settings .sma-tts-cache-meta,
+#smart-media-assistant-settings .sma-tts-cache-empty {
+  color: var(--SmartThemeQuoteColor, #999);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+#smart-media-assistant-settings .sma-tts-cache-empty {
+  padding: 14px 0;
+  text-align: center;
+}
+
+#smart-media-assistant-settings .sma-tts-cache-actions {
+  display: grid;
+  grid-template-columns: repeat(3, 30px);
+  gap: 3px;
+}
+
+#smart-media-assistant-settings .sma-icon-button {
+  display: inline-flex;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+@media (max-width: 520px) {
+  #smart-media-assistant-settings .sma-tts-cache-item {
+    grid-template-columns: 20px minmax(0, 1fr);
+  }
+
+  #smart-media-assistant-settings .sma-tts-cache-actions {
+    grid-column: 2;
+    justify-self: end;
+  }
+}
+
 /* ==================== 工具提示样式 ==================== */
 
 .smart-media-tooltip {

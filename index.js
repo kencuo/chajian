@@ -2,7 +2,7 @@
  * 智能媒体助手 - SillyTavern Extension
  * 统一的图片和文档处理插件
  * 作者: ctrl
- * 版本: 1.4.0
+ * 版本: 1.5.0
  */
 
 import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
@@ -89,6 +89,8 @@ const ttsPlaybackState = {
 const ttsCacheState = {
   databasePromise: null,
   pendingSynthesis: new Map(),
+  libraryRecords: new Map(),
+  libraryRefreshTimer: null,
 };
 const nativeTtsIntegrationState = {
   lastMessageId: null,
@@ -792,6 +794,7 @@ function initPlugin() {
 
   // 创建设置界面
   createSettingsInterface();
+  queueTtsCacheLibraryRefresh(0);
 
   // 绑定事件监听器
   bindEventListeners();
@@ -1105,6 +1108,31 @@ function createSettingsHTML() {
               </div>
             </div>
 
+            <div class="extension-content-item sma-stack sma-tts-cache-library">
+              <div class="sma-tts-cache-heading">
+                <div>
+                  <div class="settings-title-text">已生成语音 <span id="${MODULE_NAME}_ttsCacheCount">0</span></div>
+                  <div class="settings-title-description">保存在当前浏览器中的远程 TTS 音频</div>
+                </div>
+                <button id="${MODULE_NAME}_ttsCacheRefreshBtn" class="menu_button sma-icon-button" type="button" title="刷新列表" aria-label="刷新列表">
+                  <i class="fa-solid fa-rotate-right"></i>
+                </button>
+              </div>
+              <div class="sma-tts-cache-toolbar">
+                <label class="sma-tts-cache-select-all">
+                  <input id="${MODULE_NAME}_ttsCacheSelectAll" type="checkbox" />
+                  <span>全选</span>
+                </label>
+                <button id="${MODULE_NAME}_ttsCacheDownloadSelectedBtn" class="menu_button" type="button" disabled>
+                  <i class="fa-solid fa-file-zipper"></i>
+                  <span>打包下载已选</span>
+                </button>
+              </div>
+              <div id="${MODULE_NAME}_ttsCacheList" class="sma-tts-cache-list">
+                <div class="sma-tts-cache-empty">正在读取……</div>
+              </div>
+            </div>
+
           </div>
         </div>
       </div>
@@ -1369,6 +1397,54 @@ function bindEventListeners() {
   $(document).on('click', `#${MODULE_NAME}_ttsStopBtn`, function () {
     stopSpeaking();
   });
+
+  $(document).on('click', `#${MODULE_NAME}_ttsCacheRefreshBtn`, function () {
+    void renderTtsCacheLibrary();
+  });
+
+  $(document).on('change', `#${MODULE_NAME}_ttsCacheSelectAll`, function () {
+    const checked = $(this).prop('checked');
+    $(`#${MODULE_NAME}_ttsCacheList .sma-tts-cache-checkbox`).prop('checked', checked);
+    updateTtsCacheLibrarySelection();
+  });
+
+  $(document).on('change', `#${MODULE_NAME}_ttsCacheList .sma-tts-cache-checkbox`, function () {
+    updateTtsCacheLibrarySelection();
+  });
+
+  $(document).on('click', `#${MODULE_NAME}_ttsCacheList [data-sma-cache-action]`, async function () {
+    const action = String($(this).attr('data-sma-cache-action') || '');
+    const key = String($(this).closest('[data-sma-cache-key]').attr('data-sma-cache-key') || '');
+    const record = ttsCacheState.libraryRecords.get(key);
+    if (!record) {
+      showTtsToast('这条语音缓存已不存在，请刷新列表', 'error');
+      return;
+    }
+
+    try {
+      if (action === 'play') {
+        await playRemoteTtsAudio({ blob: record.blob });
+        showTtsToast('正在播放缓存语音');
+      } else if (action === 'download') {
+        downloadTtsBlob(record.blob, getTtsCacheFilename(record));
+      } else if (action === 'delete') {
+        const confirmed = await Popup.show.confirm('删除语音', '确定删除这条浏览器 TTS 缓存吗？', {
+          okButton: '删除',
+          cancelButton: '取消',
+        });
+        if (confirmed !== POPUP_RESULT.AFFIRMATIVE) return;
+        await deleteCachedTtsAudio(key);
+        await renderTtsCacheLibrary();
+        showTtsToast('语音缓存已删除');
+      }
+    } catch (error) {
+      showTtsToast(String(error?.message || error || '操作失败'), 'error');
+    }
+  });
+
+  $(document).on('click', `#${MODULE_NAME}_ttsCacheDownloadSelectedBtn`, async function () {
+    await downloadSelectedTtsCacheRecords(this);
+  });
 }
 
 /**
@@ -1466,6 +1542,7 @@ function ensureTtsAudioElement() {
   audio.addEventListener('ended', () => {
     ttsPlaybackState.isSpeaking = false;
     ttsPlaybackState.activeMode = '';
+    updateNativeTtsPauseButtons(false);
     if (ttsPlaybackState.currentObjectUrl) {
       URL.revokeObjectURL(ttsPlaybackState.currentObjectUrl);
       ttsPlaybackState.currentObjectUrl = '';
@@ -1474,6 +1551,7 @@ function ensureTtsAudioElement() {
   audio.addEventListener('error', () => {
     ttsPlaybackState.isSpeaking = false;
     ttsPlaybackState.activeMode = '';
+    updateNativeTtsPauseButtons(false);
     if (ttsPlaybackState.currentObjectUrl) {
       URL.revokeObjectURL(ttsPlaybackState.currentObjectUrl);
       ttsPlaybackState.currentObjectUrl = '';
@@ -1506,6 +1584,60 @@ function stopSpeaking() {
   }
   ttsPlaybackState.activeMode = '';
   ttsPlaybackState.isSpeaking = false;
+  updateNativeTtsPauseButtons(false);
+}
+
+function isTtsPlaybackPaused() {
+  if (ttsPlaybackState.activeMode === 'audio') {
+    return !!ttsPlaybackState.audioElement?.paused;
+  }
+  if (ttsPlaybackState.activeMode === 'browser' && typeof speechSynthesis !== 'undefined') {
+    return !!speechSynthesis.paused;
+  }
+  return false;
+}
+
+function updateNativeTtsPauseButtons(isPaused = isTtsPlaybackPaused()) {
+  if (typeof $ !== 'function') return;
+  $('[data-sma-tts-action="pause"]')
+    .toggleClass('fa-pause', !isPaused)
+    .toggleClass('fa-play', isPaused)
+    .attr('title', isPaused ? '继续播放' : '暂停播放');
+}
+
+async function toggleTtsPlaybackPause() {
+  const audio = ttsPlaybackState.audioElement;
+  if (ttsPlaybackState.activeMode === 'audio' && audio?.src) {
+    if (audio.paused) {
+      await audio.play();
+      ttsPlaybackState.isSpeaking = true;
+      updateNativeTtsPauseButtons(false);
+      return { paused: false, mode: 'audio' };
+    }
+    audio.pause();
+    ttsPlaybackState.isSpeaking = false;
+    updateNativeTtsPauseButtons(true);
+    return { paused: true, mode: 'audio' };
+  }
+
+  if (typeof speechSynthesis !== 'undefined') {
+    if (speechSynthesis.paused) {
+      speechSynthesis.resume();
+      ttsPlaybackState.activeMode = 'browser';
+      ttsPlaybackState.isSpeaking = true;
+      updateNativeTtsPauseButtons(false);
+      return { paused: false, mode: 'browser' };
+    }
+    if (speechSynthesis.speaking || speechSynthesis.pending) {
+      speechSynthesis.pause();
+      ttsPlaybackState.activeMode = 'browser';
+      ttsPlaybackState.isSpeaking = false;
+      updateNativeTtsPauseButtons(true);
+      return { paused: true, mode: 'browser' };
+    }
+  }
+
+  throw new Error('当前没有可暂停或继续的语音');
 }
 
 function pickBrowserVoice(keyword) {
@@ -1534,14 +1666,17 @@ function playViaBrowserSpeech(text) {
   utterance.onstart = () => {
     ttsPlaybackState.activeMode = 'browser';
     ttsPlaybackState.isSpeaking = true;
+    updateNativeTtsPauseButtons(false);
   };
   utterance.onend = () => {
     ttsPlaybackState.activeMode = '';
     ttsPlaybackState.isSpeaking = false;
+    updateNativeTtsPauseButtons(false);
   };
   utterance.onerror = () => {
     ttsPlaybackState.activeMode = '';
     ttsPlaybackState.isSpeaking = false;
+    updateNativeTtsPauseButtons(false);
   };
   speechSynthesis.speak(utterance);
 }
@@ -1690,10 +1825,169 @@ async function writeCachedTtsAudio(descriptor, blob, provider) {
         updatedAt: Date.now(),
       }),
     );
+    queueTtsCacheLibraryRefresh();
     return true;
   } catch (error) {
     console.warn('[Smart Media Assistant] 保存 TTS 到浏览器缓存失败', error);
     return false;
+  }
+}
+
+async function listCachedTtsAudio() {
+  try {
+    const records = await runTtsCacheTransaction('readonly', (store) => store.getAll());
+    return Array.isArray(records) ? records : [];
+  } catch (error) {
+    console.warn('[Smart Media Assistant] 读取 TTS 缓存列表失败', error);
+    throw new Error('无法读取浏览器中的 TTS 缓存');
+  }
+}
+
+async function deleteCachedTtsAudio(key) {
+  await runTtsCacheTransaction('readwrite', (store) => store.delete(key));
+  ttsCacheState.libraryRecords.delete(key);
+}
+
+function getTtsCacheRecordMetadata(record) {
+  try {
+    return JSON.parse(String(record?.signature || '{}'));
+  } catch (error) {
+    return {};
+  }
+}
+
+function formatTtsCacheSize(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatTtsCacheDate(timestamp) {
+  const date = new Date(Number(timestamp) || Date.now());
+  return Number.isNaN(date.getTime()) ? '未知时间' : date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function getTtsCacheFilename(record, index = null) {
+  const metadata = getTtsCacheRecordMetadata(record);
+  const textPart = String(metadata.text || '语音')
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 28);
+  const datePart = new Date(Number(record?.updatedAt) || Date.now()).toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const providerPart = String(record?.provider || 'tts').replace(/[^a-z0-9-]/gi, '') || 'tts';
+  const format = String(record?.format || 'mp3').replace(/[^a-z0-9]/gi, '') || 'mp3';
+  const indexPart = Number.isInteger(index) ? `${String(index + 1).padStart(3, '0')}-` : '';
+  return `${indexPart}${datePart}-${providerPart}-${textPart || '语音'}.${format}`;
+}
+
+function updateTtsCacheLibrarySelection() {
+  const $checkboxes = $(`#${MODULE_NAME}_ttsCacheList .sma-tts-cache-checkbox`);
+  const selectedCount = $checkboxes.filter(':checked').length;
+  const $selectAll = $(`#${MODULE_NAME}_ttsCacheSelectAll`);
+  $selectAll.prop('checked', $checkboxes.length > 0 && selectedCount === $checkboxes.length);
+  $selectAll.prop('indeterminate', selectedCount > 0 && selectedCount < $checkboxes.length);
+  $(`#${MODULE_NAME}_ttsCacheDownloadSelectedBtn`).prop('disabled', selectedCount === 0);
+}
+
+async function renderTtsCacheLibrary() {
+  const $list = $(`#${MODULE_NAME}_ttsCacheList`);
+  if ($list.length === 0) return;
+
+  $list.html('<div class="sma-tts-cache-empty">正在读取……</div>');
+  try {
+    const records = (await listCachedTtsAudio()).sort(
+      (left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0),
+    );
+    ttsCacheState.libraryRecords = new Map(records.map((record) => [String(record.key), record]));
+    $(`#${MODULE_NAME}_ttsCacheCount`).text(records.length);
+
+    if (!records.length) {
+      $list.html('<div class="sma-tts-cache-empty">暂无已生成语音</div>');
+      updateTtsCacheLibrarySelection();
+      return;
+    }
+
+    const html = records
+      .map((record) => {
+        const metadata = getTtsCacheRecordMetadata(record);
+        const fullText = String(metadata.text || '未记录文本').replace(/\s+/g, ' ').trim();
+        const text = fullText.length > 160 ? `${fullText.slice(0, 160)}…` : fullText;
+        const title = fullText.length > 500 ? `${fullText.slice(0, 500)}…` : fullText;
+        const provider = record.provider === 'minimax' ? 'MiniMax' : 'OpenAI 兼容';
+        const voice = String(metadata.voiceId || '').trim();
+        const meta = [provider, voice, String(record.format || 'mp3').toUpperCase(), formatTtsCacheSize(record.blob?.size)]
+          .filter(Boolean)
+          .join(' · ');
+        return `
+          <div class="sma-tts-cache-item" data-sma-cache-key="${escapeHtmlAttr(record.key)}">
+            <input class="sma-tts-cache-checkbox" type="checkbox" aria-label="选择语音" />
+            <div class="sma-tts-cache-info">
+              <div class="sma-tts-cache-text" title="${escapeHtmlAttr(title)}">${escapeHtmlAttr(text)}</div>
+              <div class="sma-tts-cache-meta">${escapeHtmlAttr(meta)} · ${escapeHtmlAttr(formatTtsCacheDate(record.updatedAt))}</div>
+            </div>
+            <div class="sma-tts-cache-actions">
+              <button class="menu_button sma-icon-button" type="button" data-sma-cache-action="play" title="播放" aria-label="播放"><i class="fa-solid fa-play"></i></button>
+              <button class="menu_button sma-icon-button" type="button" data-sma-cache-action="download" title="下载" aria-label="下载"><i class="fa-solid fa-download"></i></button>
+              <button class="menu_button sma-icon-button" type="button" data-sma-cache-action="delete" title="删除" aria-label="删除"><i class="fa-solid fa-trash"></i></button>
+            </div>
+          </div>
+        `;
+      })
+      .join('');
+    $list.html(html);
+    updateTtsCacheLibrarySelection();
+  } catch (error) {
+    ttsCacheState.libraryRecords.clear();
+    $(`#${MODULE_NAME}_ttsCacheCount`).text('0');
+    $list.html(`<div class="sma-tts-cache-empty">${escapeHtmlAttr(error?.message || '读取失败')}</div>`);
+    updateTtsCacheLibrarySelection();
+  }
+}
+
+function queueTtsCacheLibraryRefresh(delay = 150) {
+  if (ttsCacheState.libraryRefreshTimer) clearTimeout(ttsCacheState.libraryRefreshTimer);
+  ttsCacheState.libraryRefreshTimer = setTimeout(() => {
+    ttsCacheState.libraryRefreshTimer = null;
+    void renderTtsCacheLibrary();
+  }, delay);
+}
+
+async function getJsZipConstructor() {
+  if (typeof globalThis.JSZip === 'function') return globalThis.JSZip;
+  await import('../../../../lib/jszip.min.js');
+  if (typeof globalThis.JSZip !== 'function') throw new Error('无法加载 ZIP 打包组件');
+  return globalThis.JSZip;
+}
+
+async function downloadSelectedTtsCacheRecords(button) {
+  const keys = $(`#${MODULE_NAME}_ttsCacheList .sma-tts-cache-checkbox:checked`)
+    .map(function () {
+      return String($(this).closest('[data-sma-cache-key]').attr('data-sma-cache-key') || '');
+    })
+    .get();
+  const records = keys.map((key) => ttsCacheState.libraryRecords.get(key)).filter(Boolean);
+  if (!records.length) {
+    showTtsToast('请先选择要打包下载的语音');
+    return;
+  }
+
+  const $button = $(button);
+  $button.prop('disabled', true).addClass('disabled');
+  try {
+    const JSZipConstructor = await getJsZipConstructor();
+    const zip = new JSZipConstructor();
+    records.forEach((record, index) => zip.file(getTtsCacheFilename(record, index), record.blob));
+    const archive = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    const date = new Date().toISOString().slice(0, 10);
+    downloadTtsBlob(archive, `tts-cache-${date}.zip`);
+    showTtsToast(`已打包 ${records.length} 条语音`, 'success');
+  } catch (error) {
+    showTtsToast(String(error?.message || error || '打包下载失败'), 'error');
+  } finally {
+    $button.removeClass('disabled');
+    updateTtsCacheLibrarySelection();
   }
 }
 
@@ -1861,6 +2155,7 @@ async function playRemoteTtsAudio(source) {
   ttsPlaybackState.isSpeaking = true;
   try {
     await audio.play();
+    updateNativeTtsPauseButtons(false);
   } catch (error) {
     if (ttsPlaybackState.currentObjectUrl) {
       URL.revokeObjectURL(ttsPlaybackState.currentObjectUrl);
@@ -1868,6 +2163,7 @@ async function playRemoteTtsAudio(source) {
     }
     ttsPlaybackState.activeMode = '';
     ttsPlaybackState.isSpeaking = false;
+    updateNativeTtsPauseButtons(false);
     throw error;
   }
 }
@@ -1913,10 +2209,12 @@ function getTtsStatus() {
     typeof speechSynthesis !== 'undefined' &&
     (speechSynthesis.speaking || speechSynthesis.pending || speechSynthesis.paused);
 
+  const isPaused = isTtsPlaybackPaused();
   return {
     enabled: !!pluginConfig.enableTTS,
     provider: pluginConfig.ttsProvider || 'browser',
-    isSpeaking: !!ttsPlaybackState.isSpeaking || !!speechActive,
+    isSpeaking: !isPaused && (!!ttsPlaybackState.isSpeaking || !!speechActive),
+    isPaused,
     activeMode: ttsPlaybackState.activeMode || (speechActive ? 'browser' : ''),
   };
 }
@@ -2183,10 +2481,14 @@ function renderNativeTtsButtons() {
     if ($container.find('[data-sma-tts-action="download"]').length === 0) {
       createNativeTtsActionButton('download', '下载正文语音', 'fa-solid fa-download').appendTo($container);
     }
+    if ($container.find('[data-sma-tts-action="pause"]').length === 0) {
+      createNativeTtsActionButton('pause', '暂停播放', 'fa-solid fa-pause').appendTo($container);
+    }
     if ($container.find('[data-sma-tts-action="stop"]').length === 0) {
       createNativeTtsActionButton('stop', '停止朗读', 'fa-solid fa-stop').appendTo($container);
     }
   });
+  updateNativeTtsPauseButtons();
 }
 
 function queueNativeTtsButtonsRefresh(delay = 0) {
@@ -2225,6 +2527,12 @@ async function runNativeTtsAction(triggerElement, options = {}) {
   const forceRegenerate = !!options.forceRegenerate;
 
   closeNativeTtsActions(triggerElement);
+
+  if (action === 'pause') {
+    const result = await toggleTtsPlaybackPause();
+    showTtsToast(result.paused ? '已暂停播放' : '已继续播放');
+    return;
+  }
 
   if (action === 'stop') {
     stopSpeaking();

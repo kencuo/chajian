@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "ctrl",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "homePage": "https://github.com/kencuo/chajian",
   "description": "智能媒体处理插件，支持图片优化、文档处理、AI识图等功能。修复了txt、json等文档文件被误识别为图片的问题。",
   "tags": [
@@ -24,7 +24,8 @@
     "文件类型智能识别",
     "批量文件处理",
     "聊天集成支持",
-    "启动时检查插件更新并确认刷新"
+    "启动时检查插件更新并确认刷新",
+    "浏览、播放和批量下载 TTS 缓存"
   ],
   "settings": [
     {
