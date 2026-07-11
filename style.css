@@ -431,6 +431,14 @@
   animation: smart-media-pulse 2s infinite;
 }
 
+.sma_tts_action.sma-tts-pressing {
+  opacity: 0.65;
+  transform: scale(0.88);
+  transition:
+    transform 0.15s ease,
+    opacity 0.15s ease;
+}
+
 /* ==================== 工具提示样式 ==================== */
 
 .smart-media-tooltip {

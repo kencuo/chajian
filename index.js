@@ -2,16 +2,22 @@
  * 智能媒体助手 - SillyTavern Extension
  * 统一的图片和文档处理插件
  * 作者: ctrl
- * 版本: 1.5
+ * 版本: 1.4.0
  */
 
-import { saveSettingsDebounced } from '../../../../script.js';
+import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 import { getContext } from '../../../extensions.js';
+import { POPUP_RESULT, Popup } from '../../../popup.js';
 import { getStringHash, saveBase64AsFile } from '../../../utils.js';
 
 // 插件配置
 const PLUGIN_ID = 'smart-media-assistant';
 const MODULE_NAME = 'smart-media-assistant';
+const TTS_CACHE_DB_NAME = `${MODULE_NAME}-tts-cache`;
+const TTS_CACHE_STORE_NAME = 'audio';
+const TTS_CACHE_DB_VERSION = 1;
+const TTS_LONG_PRESS_MS = 650;
+const UPDATE_CHECK_DELAY_MS = 2000;
 
 // 默认配置
 const DEFAULT_CONFIG = {
@@ -80,6 +86,10 @@ const ttsPlaybackState = {
   activeMode: '',
   isSpeaking: false,
 };
+const ttsCacheState = {
+  databasePromise: null,
+  pendingSynthesis: new Map(),
+};
 const nativeTtsIntegrationState = {
   lastMessageId: null,
   chatObserver: null,
@@ -88,6 +98,12 @@ const nativeTtsIntegrationState = {
   contextEventsBound: false,
   slashCommandRegistered: false,
   slashCommandObject: null,
+  longPressTimer: null,
+  longPressTarget: null,
+};
+const extensionUpdateState = {
+  scheduled: false,
+  checking: false,
 };
 
 function escapeHtmlAttr(value) {
@@ -113,6 +129,98 @@ function getPluginContextSafe() {
   } catch (error) {
     return null;
   }
+}
+
+function getSelfUpdateInstallInfo() {
+  try {
+    const pathParts = new URL(import.meta.url).pathname
+      .split('/')
+      .filter(Boolean)
+      .map((part) => decodeURIComponent(part));
+    const thirdPartyIndex = pathParts.lastIndexOf('third-party');
+    const extensionName = thirdPartyIndex >= 0 ? pathParts[thirdPartyIndex + 1] : '';
+    return extensionName ? { extensionName, global: false } : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function requestExtensionUpdateApi(endpoint, installInfo, signal) {
+  const response = await fetch(`/api/extensions/${endpoint}`, {
+    method: 'POST',
+    headers: getRequestHeaders(),
+    body: JSON.stringify(installInfo),
+    signal,
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `${response.status} ${response.statusText}`);
+  }
+  return await response.json();
+}
+
+async function checkForSelfUpdate() {
+  if (extensionUpdateState.checking) return;
+  const installInfo = getSelfUpdateInstallInfo();
+  if (!installInfo) return;
+
+  extensionUpdateState.checking = true;
+  let versionInfo;
+  try {
+    const signal =
+      typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+        ? AbortSignal.timeout(30000)
+        : undefined;
+    versionInfo = await requestExtensionUpdateApi('version', installInfo, signal);
+  } catch (error) {
+    console.debug('[Smart Media Assistant] 启动更新检查已跳过', error);
+    extensionUpdateState.checking = false;
+    return;
+  }
+
+  if (versionInfo?.isUpToDate !== false) {
+    extensionUpdateState.checking = false;
+    return;
+  }
+
+  const result = await Popup.show.confirm(
+    '发现插件新版本',
+    '“ctrl大杂烩”已有更新。是否立即更新并刷新页面？',
+    {
+      okButton: '更新并刷新',
+      cancelButton: '暂不更新',
+    },
+  );
+  if (result !== POPUP_RESULT.AFFIRMATIVE) {
+    extensionUpdateState.checking = false;
+    return;
+  }
+
+  const updatingToast =
+    typeof toastr !== 'undefined'
+      ? toastr.info('正在拉取插件更新，请稍候……', '插件更新', { timeOut: 0, extendedTimeOut: 0 })
+      : null;
+  try {
+    await requestExtensionUpdateApi('update', installInfo);
+    if (typeof toastr !== 'undefined') {
+      if (updatingToast) toastr.clear(updatingToast);
+      toastr.success('更新完成，正在刷新页面……', '插件更新');
+    }
+    setTimeout(() => window.location.reload(), 500);
+  } catch (error) {
+    if (typeof toastr !== 'undefined') {
+      if (updatingToast) toastr.clear(updatingToast);
+      toastr.error(String(error?.message || error || '未知错误'), '插件更新失败', { timeOut: 8000 });
+    }
+    console.error('[Smart Media Assistant] 插件更新失败', error);
+    extensionUpdateState.checking = false;
+  }
+}
+
+function scheduleSelfUpdateCheck() {
+  if (extensionUpdateState.scheduled) return;
+  extensionUpdateState.scheduled = true;
+  setTimeout(() => void checkForSelfUpdate(), UPDATE_CHECK_DELAY_MS);
 }
 
 function getMiniMaxApiHostByKey(hostKey) {
@@ -689,6 +797,7 @@ function initPlugin() {
   bindEventListeners();
   syncTtsFormState();
   initNativeTtsIntegrations();
+  scheduleSelfUpdateCheck();
 
   // 绑定收缩栏功能
   bindCollapsibleEvents();
@@ -1094,12 +1203,12 @@ function syncTtsFormState() {
   $(`#${MODULE_NAME}_ttsTestBtn`).prop('disabled', !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsStopBtn`).prop('disabled', !pluginConfig.enableTTS);
 
-  let helpText = '浏览器系统语音不需要接口配置，会直接调用当前设备可用的系统语音。';
+  let helpText = '浏览器系统语音不需要接口配置，但不会产生可缓存或下载的音频文件。';
   if (provider === 'minimax') {
     helpText =
-      'MiniMax 需要 API Key 和 Group ID；可在 Official / Global / Mainland China 之间切换源，接口地址也可以手动覆盖。';
+      'MiniMax 需要 API Key 和 Group ID；生成的语音会保存在浏览器中，消息喇叭长按可重新生成。';
   } else if (provider === 'openai-compatible') {
-    helpText = 'OpenAI 兼容模式通常填写完整的 /audio/speech 地址，并使用 voice + model 进行合成。';
+    helpText = '填写完整的 /audio/speech 地址；生成的语音会保存在浏览器中，消息喇叭长按可重新生成。';
   }
 
   $(`#${MODULE_NAME}_ttsRemoteHint`).text(helpText);
@@ -1365,6 +1474,10 @@ function ensureTtsAudioElement() {
   audio.addEventListener('error', () => {
     ttsPlaybackState.isSpeaking = false;
     ttsPlaybackState.activeMode = '';
+    if (ttsPlaybackState.currentObjectUrl) {
+      URL.revokeObjectURL(ttsPlaybackState.currentObjectUrl);
+      ttsPlaybackState.currentObjectUrl = '';
+    }
   });
   document.body.appendChild(audio);
   ttsPlaybackState.audioElement = audio;
@@ -1456,7 +1569,16 @@ function buildMiniMaxTtsUrl(rawUrl, groupId) {
   return url.toString();
 }
 
-function hexToBlobUrl(hex, format = 'mp3') {
+function getTtsAudioMimeType(format = 'mp3') {
+  const mimeMap = {
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    flac: 'audio/flac',
+  };
+  return mimeMap[String(format || '').toLowerCase()] || 'audio/mpeg';
+}
+
+function hexToAudioBlob(hex, format = 'mp3') {
   const cleanHex = String(hex || '').replace(/\s+/g, '');
   if (!cleanHex) {
     throw new Error('语音接口未返回音频数据');
@@ -1470,13 +1592,109 @@ function hexToBlobUrl(hex, format = 'mp3') {
     bytes[i / 2] = parseInt(cleanHex.slice(i, i + 2), 16);
   }
 
-  const mimeMap = {
-    mp3: 'audio/mpeg',
-    wav: 'audio/wav',
-    flac: 'audio/flac',
+  return new Blob([bytes], { type: getTtsAudioMimeType(format) });
+}
+
+function openTtsCacheDatabase() {
+  if (typeof indexedDB === 'undefined') {
+    return Promise.reject(new Error('当前浏览器不支持 IndexedDB'));
+  }
+  if (ttsCacheState.databasePromise) return ttsCacheState.databasePromise;
+
+  ttsCacheState.databasePromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(TTS_CACHE_DB_NAME, TTS_CACHE_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(TTS_CACHE_STORE_NAME)) {
+        database.createObjectStore(TTS_CACHE_STORE_NAME, { keyPath: 'key' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('无法打开 TTS 浏览器缓存'));
+    request.onblocked = () => reject(new Error('TTS 浏览器缓存数据库被其他页面占用'));
+  });
+
+  return ttsCacheState.databasePromise;
+}
+
+function runTtsCacheTransaction(mode, operation) {
+  return openTtsCacheDatabase().then(
+    (database) =>
+      new Promise((resolve, reject) => {
+        const transaction = database.transaction(TTS_CACHE_STORE_NAME, mode);
+        const store = transaction.objectStore(TTS_CACHE_STORE_NAME);
+        let request;
+        let result;
+        try {
+          request = operation(store);
+        } catch (error) {
+          transaction.abort();
+          reject(error);
+          return;
+        }
+        request.onsuccess = () => {
+          result = request.result;
+        };
+        request.onerror = () => reject(request.error || transaction.error || new Error('TTS 缓存操作失败'));
+        transaction.oncomplete = () => resolve(result);
+        transaction.onerror = () => reject(transaction.error || new Error('TTS 缓存事务失败'));
+        transaction.onabort = () => reject(transaction.error || new Error('TTS 缓存事务已取消'));
+      }),
+  );
+}
+
+function getTtsCacheDescriptor(text, provider) {
+  const format = String(pluginConfig.ttsFormat || 'mp3').trim().toLowerCase() || 'mp3';
+  const signature = JSON.stringify({
+    version: 1,
+    text,
+    provider,
+    apiUrl: String(pluginConfig.ttsApiUrl || '').trim(),
+    groupId: provider === 'minimax' ? String(pluginConfig.ttsGroupId || '').trim() : '',
+    model: String(pluginConfig.ttsModel || '').trim() || getDefaultTtsModel(provider),
+    voiceId: String(pluginConfig.ttsVoiceId || '').trim(),
+    format,
+    speed: coerceNumber(pluginConfig.ttsSpeed, 1),
+    volume: coerceNumber(pluginConfig.ttsVolume, 1),
+    pitch: coerceNumber(pluginConfig.ttsPitch, 0),
+  });
+  return {
+    key: `${provider}:${getStringHash(signature)}`,
+    signature,
+    format,
   };
-  const blob = new Blob([bytes], { type: mimeMap[format] || 'audio/mpeg' });
-  return URL.createObjectURL(blob);
+}
+
+async function readCachedTtsAudio(descriptor) {
+  try {
+    const record = await runTtsCacheTransaction('readonly', (store) => store.get(descriptor.key));
+    if (record?.signature !== descriptor.signature || !(record?.blob instanceof Blob) || !record.blob.size) {
+      return null;
+    }
+    return record.blob;
+  } catch (error) {
+    console.warn('[Smart Media Assistant] 读取 TTS 浏览器缓存失败，将重新生成', error);
+    return null;
+  }
+}
+
+async function writeCachedTtsAudio(descriptor, blob, provider) {
+  try {
+    await runTtsCacheTransaction('readwrite', (store) =>
+      store.put({
+        key: descriptor.key,
+        signature: descriptor.signature,
+        blob,
+        provider,
+        format: descriptor.format,
+        updatedAt: Date.now(),
+      }),
+    );
+    return true;
+  } catch (error) {
+    console.warn('[Smart Media Assistant] 保存 TTS 到浏览器缓存失败', error);
+    return false;
+  }
 }
 
 async function parseRemoteError(response, fallbackMessage) {
@@ -1560,8 +1778,7 @@ async function synthesizeMiniMaxSpeech(text) {
   }
 
   return {
-    url: hexToBlobUrl(data?.data?.audio, pluginConfig.ttsFormat || 'mp3'),
-    revokeAfterUse: true,
+    blob: hexToAudioBlob(data?.data?.audio, pluginConfig.ttsFormat || 'mp3'),
   };
 }
 
@@ -1602,18 +1819,43 @@ async function synthesizeOpenAICompatibleSpeech(text) {
   }
 
   return {
-    url: URL.createObjectURL(blob),
-    revokeAfterUse: true,
+    blob,
   };
+}
+
+async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
+  const descriptor = getTtsCacheDescriptor(text, provider);
+  if (!options.forceRegenerate) {
+    const cachedBlob = await readCachedTtsAudio(descriptor);
+    if (cachedBlob) {
+      return { blob: cachedBlob, cacheHit: true, cacheSaved: true, descriptor };
+    }
+  }
+
+  const createAudio = async () => {
+    const source =
+      provider === 'minimax'
+        ? await synthesizeMiniMaxSpeech(text)
+        : await synthesizeOpenAICompatibleSpeech(text);
+    const cacheSaved = await writeCachedTtsAudio(descriptor, source.blob, provider);
+    return { blob: source.blob, cacheHit: false, cacheSaved, descriptor };
+  };
+
+  if (options.forceRegenerate) return await createAudio();
+  if (!ttsCacheState.pendingSynthesis.has(descriptor.key)) {
+    const pending = createAudio().finally(() => ttsCacheState.pendingSynthesis.delete(descriptor.key));
+    ttsCacheState.pendingSynthesis.set(descriptor.key, pending);
+  }
+  return await ttsCacheState.pendingSynthesis.get(descriptor.key);
 }
 
 async function playRemoteTtsAudio(source) {
   const audio = ensureTtsAudioElement();
   stopSpeaking();
-  if (source.revokeAfterUse) {
-    ttsPlaybackState.currentObjectUrl = source.url;
-  }
-  audio.src = source.url;
+  const objectUrl = source.blob ? URL.createObjectURL(source.blob) : source.url;
+  if (!objectUrl) throw new Error('没有可播放的 TTS 音频');
+  ttsPlaybackState.currentObjectUrl = objectUrl;
+  audio.src = objectUrl;
   audio.currentTime = 0;
   ttsPlaybackState.activeMode = 'audio';
   ttsPlaybackState.isSpeaking = true;
@@ -1654,13 +1896,16 @@ async function speakTextWithConfiguredProvider(text, options = {}) {
     return { success: true, provider, mode: 'browser' };
   }
 
-  const source =
-    provider === 'minimax'
-      ? await synthesizeMiniMaxSpeech(cleanText)
-      : await synthesizeOpenAICompatibleSpeech(cleanText);
+  const source = await getOrCreateRemoteTtsAudio(cleanText, provider, options);
 
   await playRemoteTtsAudio(source);
-  return { success: true, provider, mode: 'audio' };
+  return {
+    success: true,
+    provider,
+    mode: 'audio',
+    cacheHit: source.cacheHit,
+    cacheSaved: source.cacheSaved,
+  };
 }
 
 function getTtsStatus() {
@@ -1863,6 +2108,45 @@ async function speakChatMessageById(messageId, mode = 'content', options = {}) {
   });
 }
 
+function getChatMessageTtsText(messageId, mode = 'content') {
+  return mode === 'quote' ? getChatMessageQuotedText(messageId) : getChatMessageContentText(messageId);
+}
+
+function downloadTtsBlob(blob, filename) {
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = objectUrl;
+  link.download = filename;
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
+async function downloadChatMessageTtsById(messageId, mode = 'content', options = {}) {
+  if (!pluginConfig.enableTTS) {
+    throw new Error('TTS 功能已关闭，请先在插件设置中开启');
+  }
+  const provider = options.provider || pluginConfig.ttsProvider || 'browser';
+  if (provider === 'browser') {
+    throw new Error('浏览器系统语音不提供音频文件，请切换到 MiniMax 或 OpenAI 兼容 TTS 后下载');
+  }
+
+  const resolvedId = resolveTargetMessageId(messageId);
+  if (resolvedId === null) throw new Error('未找到可下载语音的消息');
+  const text = getChatMessageTtsText(resolvedId, mode);
+  if (!text) {
+    throw new Error(mode === 'quote' ? '这条消息里没有双引号内容' : '这条消息没有可生成语音的正文');
+  }
+
+  const cleanText = sanitizeTtsText(text);
+  const source = await getOrCreateRemoteTtsAudio(cleanText, provider, options);
+  const format = source.descriptor.format || 'mp3';
+  downloadTtsBlob(source.blob, `tts-message-${resolvedId}-${mode}.${format}`);
+  return source;
+}
+
 function createNativeTtsActionButton(action, title, iconClass) {
   return $(`
     <div
@@ -1887,10 +2171,17 @@ function renderNativeTtsButtons() {
     if ($container.length === 0) return;
 
     if ($container.find('[data-sma-tts-action="content"]').length === 0) {
-      createNativeTtsActionButton('content', '朗读正文', 'fa-solid fa-bullhorn').appendTo($container);
+      createNativeTtsActionButton('content', '播放正文语音（长按重新生成）', 'fa-solid fa-bullhorn').appendTo(
+        $container,
+      );
     }
     if ($container.find('[data-sma-tts-action="quote"]').length === 0) {
-      createNativeTtsActionButton('quote', '朗读双引号内容', 'fa-solid fa-quote-right').appendTo($container);
+      createNativeTtsActionButton('quote', '播放双引号语音（长按重新生成）', 'fa-solid fa-quote-right').appendTo(
+        $container,
+      );
+    }
+    if ($container.find('[data-sma-tts-action="download"]').length === 0) {
+      createNativeTtsActionButton('download', '下载正文语音', 'fa-solid fa-download').appendTo($container);
     }
     if ($container.find('[data-sma-tts-action="stop"]').length === 0) {
       createNativeTtsActionButton('stop', '停止朗读', 'fa-solid fa-stop').appendTo($container);
@@ -1916,6 +2207,64 @@ function closeNativeTtsActions(triggerElement) {
   $buttons.siblings('.extraMesButtonsHint').show().css('opacity', '');
 }
 
+function clearNativeTtsLongPress() {
+  if (nativeTtsIntegrationState.longPressTimer) {
+    clearTimeout(nativeTtsIntegrationState.longPressTimer);
+    nativeTtsIntegrationState.longPressTimer = null;
+  }
+  if (nativeTtsIntegrationState.longPressTarget) {
+    $(nativeTtsIntegrationState.longPressTarget).removeClass('sma-tts-pressing');
+    nativeTtsIntegrationState.longPressTarget = null;
+  }
+}
+
+async function runNativeTtsAction(triggerElement, options = {}) {
+  const $target = $(triggerElement);
+  const action = String($target.attr('data-sma-tts-action') || '').trim();
+  const messageId = rememberNativeTtsMessageId($target.closest('.mes').attr('mesid'));
+  const forceRegenerate = !!options.forceRegenerate;
+
+  closeNativeTtsActions(triggerElement);
+
+  if (action === 'stop') {
+    stopSpeaking();
+    showTtsToast('已停止朗读');
+    return;
+  }
+
+  if (action === 'download') {
+    const source = await downloadChatMessageTtsById(messageId, 'content');
+    const message = source.cacheHit
+      ? '已下载浏览器中缓存的正文语音'
+      : source.cacheSaved
+        ? '语音已生成、保存并下载'
+        : '语音已生成并下载，但浏览器缓存保存失败';
+    showTtsToast(message, source.cacheSaved ? 'success' : 'info');
+    return;
+  }
+
+  const mode = action === 'quote' ? 'quote' : 'content';
+  const label = mode === 'quote' ? '双引号内容' : '消息正文';
+  const result = await speakChatMessageById(messageId, mode, {
+    source: 'st-native-menu',
+    forceRegenerate,
+  });
+  if (result.mode === 'browser') {
+    showTtsToast(`开始朗读${label}`, 'success');
+  } else if (forceRegenerate) {
+    showTtsToast(
+      result.cacheSaved ? `已重新生成、保存并播放${label}` : `已重新生成并播放${label}，但浏览器缓存保存失败`,
+      result.cacheSaved ? 'success' : 'info',
+    );
+  } else if (result.cacheHit) {
+    showTtsToast(`正在播放浏览器中已缓存的${label}`, 'success');
+  } else if (result.cacheSaved) {
+    showTtsToast(`语音已生成、保存并开始播放${label}`, 'success');
+  } else {
+    showTtsToast(`语音已生成并开始播放，但浏览器缓存保存失败`, 'info');
+  }
+}
+
 function bindNativeTtsMenuEvents() {
   if (nativeTtsIntegrationState.domEventsBound || typeof $ !== 'function') return;
   nativeTtsIntegrationState.domEventsBound = true;
@@ -1926,31 +2275,55 @@ function bindNativeTtsMenuEvents() {
     rememberNativeTtsMessageId($(this).closest('.mes').attr('mesid'));
   });
 
+  $(document).on(
+    'pointerdown.smaTtsNative',
+    '[data-sma-tts-action="content"], [data-sma-tts-action="quote"]',
+    function (event) {
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      clearNativeTtsLongPress();
+      const target = this;
+      $(target).removeAttr('data-sma-long-press-handled');
+      nativeTtsIntegrationState.longPressTarget = target;
+      $(target).addClass('sma-tts-pressing');
+      nativeTtsIntegrationState.longPressTimer = setTimeout(async () => {
+        nativeTtsIntegrationState.longPressTimer = null;
+        nativeTtsIntegrationState.longPressTarget = null;
+        $(target).removeClass('sma-tts-pressing').attr('data-sma-long-press-handled', 'true');
+        try {
+          await runNativeTtsAction(target, { forceRegenerate: true });
+        } catch (error) {
+          showTtsToast(getFriendlyFetchErrorMessage(error, pluginConfig.ttsProvider), 'error');
+        }
+      }, TTS_LONG_PRESS_MS);
+    },
+  );
+
+  $(document).on(
+    'pointerup.smaTtsNative pointercancel.smaTtsNative pointerleave.smaTtsNative',
+    '[data-sma-tts-action="content"], [data-sma-tts-action="quote"]',
+    function () {
+      if (nativeTtsIntegrationState.longPressTarget === this) clearNativeTtsLongPress();
+    },
+  );
+
+  $(document).on(
+    'contextmenu.smaTtsNative',
+    '[data-sma-tts-action="content"], [data-sma-tts-action="quote"]',
+    (event) => event.preventDefault(),
+  );
+
   $(document).on('click.smaTtsNative', '[data-sma-tts-action]', async function (event) {
     event.preventDefault();
     event.stopPropagation();
 
     const $target = $(this);
-    const action = String($target.attr('data-sma-tts-action') || '').trim();
-    const messageId = rememberNativeTtsMessageId($target.closest('.mes').attr('mesid'));
-
-    closeNativeTtsActions(this);
+    if ($target.attr('data-sma-long-press-handled') === 'true') {
+      $target.removeAttr('data-sma-long-press-handled');
+      return;
+    }
 
     try {
-      if (action === 'stop') {
-        stopSpeaking();
-        showTtsToast('已停止朗读');
-        return;
-      }
-
-      if (action === 'quote') {
-        await speakChatMessageById(messageId, 'quote', { source: 'st-native-menu' });
-        showTtsToast('开始朗读双引号内容', 'success');
-        return;
-      }
-
-      await speakChatMessageById(messageId, 'content', { source: 'st-native-menu' });
-      showTtsToast('开始朗读消息正文', 'success');
+      await runNativeTtsAction(this);
     } catch (error) {
       showTtsToast(getFriendlyFetchErrorMessage(error, pluginConfig.ttsProvider), 'error');
     }
