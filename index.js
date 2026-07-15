@@ -2894,13 +2894,85 @@ function normalizeSmartMediaImageBridgeResult(result, payload) {
   };
 }
 
+function waitForZhihuijiAssistantImage(existingSources = new Set(), payload = {}, timeoutMs = 180000) {
+  const body = document.getElementById('st-chatu8-ai-chat-body');
+  if (!body || typeof MutationObserver === 'undefined') {
+    return Promise.resolve({
+      id: payload.id,
+      prompt: payload.prompt,
+      pending: true,
+      images: [],
+      source: 'smart-media-assistant:zhihuiji-assistant-dom',
+      message: '已发送给智绘姬，但无法监听图片返回。请在智绘姬面板中查看生成结果。',
+    });
+  }
+
+  return new Promise(resolve => {
+    let settled = false;
+    let observer = null;
+    let timer = null;
+
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (observer) observer.disconnect();
+      resolve(value);
+    };
+
+    const findNewImage = () => {
+      const imgs = Array.from(body.querySelectorAll('img'));
+      for (let i = imgs.length - 1; i >= 0; i--) {
+        const img = imgs[i];
+        const src = String(img.currentSrc || img.src || img.getAttribute('src') || '').trim();
+        if (!src || existingSources.has(src)) continue;
+        if (src.includes('智绘姬头像') || src.includes('avatar')) continue;
+        return src;
+      }
+      return '';
+    };
+
+    const check = () => {
+      const imageUrl = findNewImage();
+      if (!imageUrl) return;
+      finish({
+        id: payload.id,
+        prompt: payload.prompt,
+        images: [imageUrl],
+        imageUrl,
+        format: 'png',
+        source: 'smart-media-assistant:zhihuiji-assistant-dom',
+      });
+    };
+
+    observer = new MutationObserver(() => setTimeout(check, 80));
+    observer.observe(body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+    timer = setTimeout(() => {
+      finish({
+        id: payload.id,
+        prompt: payload.prompt,
+        pending: true,
+        images: [],
+        source: 'smart-media-assistant:zhihuiji-assistant-dom-timeout',
+        message: '已发送给智绘姬，但未能自动捕获生成图片。请在智绘姬面板中查看结果。',
+      });
+    }, timeoutMs);
+    setTimeout(check, 300);
+  });
+}
+
 function sendPromptToZhihuijiAssistantFromSmartMedia(payload = {}) {
   const prompt = String(payload.prompt || '').trim();
   if (!prompt) return null;
+  const body = document.getElementById('st-chatu8-ai-chat-body');
   const input = document.getElementById('st-chatu8-ai-input');
   const sendBtn = document.getElementById('st-chatu8-ai-send');
   const trigger = document.getElementById('st-chatu8-ai-trigger');
   if (!input || !sendBtn) return null;
+
+  const existingSources = new Set(
+    body ? Array.from(body.querySelectorAll('img')).map(img => String(img.currentSrc || img.src || img.getAttribute('src') || '').trim()).filter(Boolean) : []
+  );
 
   try { trigger?.click?.(); } catch (e) {}
   const negative = String(payload.negative_prompt || payload.negativePrompt || '').trim();
@@ -2918,16 +2990,8 @@ function sendPromptToZhihuijiAssistantFromSmartMedia(payload = {}) {
   input.dispatchEvent(new Event('input', { bubbles: true }));
   input.dispatchEvent(new Event('change', { bubbles: true }));
   sendBtn.click();
-  return {
-    id: payload.id,
-    prompt,
-    pending: true,
-    images: [],
-    source: 'smart-media-assistant:zhihuiji-assistant-dom',
-    message: '已把生图请求发送给智绘姬 AI 助手，请等待智绘姬在聊天中返回图片。',
-  };
+  return waitForZhihuijiAssistantImage(existingSources, payload, Number(payload.timeoutMs) || 180000);
 }
-
 function getSmartMediaImageBridgeEventSource() {
   try {
     const context = typeof getContext === 'function' ? getContext() : null;
@@ -3066,4 +3130,5 @@ try {
   exposeGlobalBridge();
 } catch (e) {}
 export { DocumentProcessor, FileProcessor, FileTypeDetector, FileValidator, ImageProcessor };
+
 
