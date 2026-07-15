@@ -2814,6 +2814,233 @@ function initNativeTtsIntegrations() {
   setTimeout(() => installTtsSlashCommand(true), 1000);
 }
 
+function resolveSmartMediaImageBridgeFunction(root, path) {
+  const parts = String(path || '').split('.').filter(Boolean);
+  let owner = null;
+  let current = root;
+  for (const part of parts) {
+    if (!current || !(part in current)) return null;
+    owner = current;
+    current = current[part];
+  }
+  return typeof current === 'function' ? { fn: current, owner } : null;
+}
+
+function getSmartMediaImageBridgeWindowCandidates() {
+  const candidates = [];
+  const seen = new Set();
+  const push = win => {
+    if (!win || seen.has(win)) return;
+    seen.add(win);
+    candidates.push(win);
+  };
+  try { push(window); } catch (e) {}
+  try { push(globalThis); } catch (e) {}
+  try { if (typeof parent !== 'undefined') push(parent); } catch (e) {}
+  try { if (typeof top !== 'undefined') push(top); } catch (e) {}
+  return candidates;
+}
+
+function getKnownZhihuijiGeneratorForSmartMedia() {
+  const paths = [
+    '__stChatu8GenerateImage',
+    '__st_chatu8_generate_image',
+    '__zhihuijiGenerateImage',
+    'stChatu8.generateImage',
+    'stChatu8.generate',
+    'STChatu8.generateImage',
+    'STChatu8.generate',
+    'zhihuiji.generateImage',
+    'zhihuiji.generate',
+    'ZhihuiJi.generateImage',
+    'ZhihuiJi.generate',
+    'smartImage.generateImage',
+    'smartImage.generate',
+  ];
+  for (const root of getSmartMediaImageBridgeWindowCandidates()) {
+    for (const path of paths) {
+      try {
+        const resolved = resolveSmartMediaImageBridgeFunction(root, path);
+        if (resolved) return { ...resolved, path };
+      } catch (e) {}
+    }
+  }
+  return null;
+}
+
+function normalizeSmartMediaImageBridgeResult(result, payload) {
+  const images = [];
+  const push = value => {
+    const text = String(value || '').trim();
+    if (text) images.push(text);
+  };
+  if (result) {
+    if (Array.isArray(result)) result.forEach(push);
+    if (Array.isArray(result.images)) result.images.forEach(push);
+    if (Array.isArray(result.urls)) result.urls.forEach(push);
+    push(result.imageData);
+    push(result.imageUrl);
+    push(result.url);
+    push(result.src);
+  }
+  return {
+    id: payload && payload.id,
+    prompt: payload && payload.prompt,
+    images,
+    imageData: result && result.imageData,
+    imageUrl: result && (result.imageUrl || result.url || result.src),
+    format: result && result.format || 'png',
+    raw: result,
+  };
+}
+
+function sendPromptToZhihuijiAssistantFromSmartMedia(payload = {}) {
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) return null;
+  const input = document.getElementById('st-chatu8-ai-input');
+  const sendBtn = document.getElementById('st-chatu8-ai-send');
+  const trigger = document.getElementById('st-chatu8-ai-trigger');
+  if (!input || !sendBtn) return null;
+
+  try { trigger?.click?.(); } catch (e) {}
+  const negative = String(payload.negative_prompt || payload.negativePrompt || '').trim();
+  const size = payload.width && payload.height ? `\n画布尺寸：${payload.width}x${payload.height}` : '';
+  const message = [
+    '请按下面的提示词进行文生图，并把生成的图片发回当前聊天。',
+    '',
+    '正向提示词：',
+    prompt,
+    negative ? `\n反向提示词：\n${negative}` : '',
+    size,
+  ].filter(Boolean).join('\n');
+
+  input.value = message;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  sendBtn.click();
+  return {
+    id: payload.id,
+    prompt,
+    pending: true,
+    images: [],
+    source: 'smart-media-assistant:zhihuiji-assistant-dom',
+    message: '已把生图请求发送给智绘姬 AI 助手，请等待智绘姬在聊天中返回图片。',
+  };
+}
+
+function getSmartMediaImageBridgeEventSource() {
+  try {
+    const context = typeof getContext === 'function' ? getContext() : null;
+    if (context && context.eventSource) return context.eventSource;
+  } catch (e) {}
+  try { if (globalThis.eventSource) return globalThis.eventSource; } catch (e) {}
+  try { if (window.eventSource) return window.eventSource; } catch (e) {}
+  return null;
+}
+
+function addSmartMediaImageBridgeEventListener(eventSource, eventName, handler) {
+  if (!eventSource) return false;
+  if (typeof eventSource.on === 'function') {
+    eventSource.on(eventName, handler);
+    return true;
+  }
+  if (typeof eventSource.addEventListener === 'function') {
+    eventSource.addEventListener(eventName, handler);
+    return true;
+  }
+  return false;
+}
+
+function removeSmartMediaImageBridgeEventListener(eventSource, eventName, handler) {
+  if (!eventSource) return;
+  if (typeof eventSource.removeListener === 'function') {
+    eventSource.removeListener(eventName, handler);
+    return;
+  }
+  if (typeof eventSource.off === 'function') {
+    eventSource.off(eventName, handler);
+    return;
+  }
+  if (typeof eventSource.removeEventListener === 'function') {
+    eventSource.removeEventListener(eventName, handler);
+  }
+}
+
+async function requestZhihuijiImageForPhone(payload = {}, options = {}) {
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) throw new Error('提示词不能为空');
+
+  const direct = getKnownZhihuijiGeneratorForSmartMedia();
+  if (direct) {
+    const result = await direct.fn.call(direct.owner, payload, options);
+    return {
+      ...normalizeSmartMediaImageBridgeResult(result, payload),
+      source: `smart-media-assistant:${direct.path}`,
+    };
+  }
+
+  const assistantResult = sendPromptToZhihuijiAssistantFromSmartMedia(payload);
+  if (assistantResult) return assistantResult;
+
+  const eventSource = getSmartMediaImageBridgeEventSource();
+  if (!eventSource) {
+    throw new Error('ctrl大杂烩已加载，但没有找到 SillyTavern eventSource，无法转发给智绘姬。');
+  }
+
+  const id = payload.id || `smart-media-phone-image-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const requestPayload = { ...payload, id, prompt };
+  const timeoutMs = Number(options.timeoutMs) || 90000;
+
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    let settled = false;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      removeSmartMediaImageBridgeEventListener(eventSource, 'GENERATE_IMAGE_RESPONSE', onResponse);
+      removeSmartMediaImageBridgeEventListener(eventSource, 'ST_CHATU8_IMAGE_RESPONSE', onResponse);
+      removeSmartMediaImageBridgeEventListener(eventSource, 'ZH_SHARED_IMAGE_RESPONSE', onResponse);
+    };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onResponse = response => {
+      const data = response && response.detail ? response.detail : response;
+      if (!data || data.id !== id) return;
+      if (data.success === false) {
+        finish(new Error(data.error || '智绘姬生图失败'));
+        return;
+      }
+      finish(null, {
+        ...normalizeSmartMediaImageBridgeResult(data, requestPayload),
+        source: 'smart-media-assistant:eventSource',
+      });
+    };
+
+    const listening = [
+      addSmartMediaImageBridgeEventListener(eventSource, 'GENERATE_IMAGE_RESPONSE', onResponse),
+      addSmartMediaImageBridgeEventListener(eventSource, 'ST_CHATU8_IMAGE_RESPONSE', onResponse),
+      addSmartMediaImageBridgeEventListener(eventSource, 'ZH_SHARED_IMAGE_RESPONSE', onResponse),
+    ].some(Boolean);
+    if (!listening) {
+      finish(new Error('无法监听智绘姬生成响应'));
+      return;
+    }
+
+    timer = setTimeout(() => finish(new Error('智绘姬生图超时')), timeoutMs);
+    try {
+      if (typeof eventSource.emit !== 'function') throw new Error('eventSource 不支持 emit');
+      eventSource.emit('GENERATE_IMAGE_REQUEST', requestPayload);
+      eventSource.emit('ST_CHATU8_IMAGE_REQUEST', requestPayload);
+      eventSource.emit('ZH_SHARED_IMAGE_REQUEST', requestPayload);
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
 function exposeGlobalBridge() {
   try {
     const target = typeof window !== 'undefined' ? window : globalThis;
@@ -2829,6 +3056,8 @@ function exposeGlobalBridge() {
       speakChatMessageById(messageId, mode, options);
     target.smartMediaAssistant.stopSpeaking = () => stopSpeaking();
     target.smartMediaAssistant.getTtsStatus = () => getTtsStatus();
+    target.__smartMediaAssistantGenerateImageForPhone = requestZhihuijiImageForPhone;
+    target.smartMediaAssistant.generateImageForPhone = (payload, options) => requestZhihuijiImageForPhone(payload, options);
   } catch (e) {
     console.warn('[Smart Media Assistant] 暴露全局桥接失败', e);
   }
@@ -2837,3 +3066,4 @@ try {
   exposeGlobalBridge();
 } catch (e) {}
 export { DocumentProcessor, FileProcessor, FileTypeDetector, FileValidator, ImageProcessor };
+
