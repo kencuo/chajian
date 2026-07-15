@@ -2978,7 +2978,7 @@ function sendPromptToZhihuijiAssistantFromSmartMedia(payload = {}) {
   const negative = String(payload.negative_prompt || payload.negativePrompt || '').trim();
   const size = payload.width && payload.height ? `\n画布尺寸：${payload.width}x${payload.height}` : '';
   const message = [
-    '请按下面的提示词进行文生图，并把生成的图片发回当前聊天。',
+    '请按下面的提示词进行文生图，并把这里的正向/反向提示词分别追加到你当前应用的既有正向/反向提示词最前面；不要覆盖现有提示词。生成后把图片发回当前聊天。',
     '',
     '正向提示词：',
     prompt,
@@ -3033,6 +3033,16 @@ function removeSmartMediaImageBridgeEventListener(eventSource, eventName, handle
 async function requestZhihuijiImageForPhone(payload = {}, options = {}) {
   const prompt = String(payload.prompt || '').trim();
   if (!prompt) throw new Error('提示词不能为空');
+  const negativePrompt = String(payload.negative_prompt || payload.negativePrompt || '').trim();
+  payload = {
+    ...payload,
+    prompt,
+    prompt_prefix: prompt,
+    positive_prompt_prefix: prompt,
+    negative_prompt_prefix: negativePrompt,
+    prompt_merge_mode: 'prepend',
+    mergeMode: 'prepend',
+  };
 
   const direct = getKnownZhihuijiGeneratorForSmartMedia();
   if (direct) {
@@ -3130,5 +3140,7 @@ try {
   exposeGlobalBridge();
 } catch (e) {}
 export { DocumentProcessor, FileProcessor, FileTypeDetector, FileValidator, ImageProcessor };
+
+
 
 
