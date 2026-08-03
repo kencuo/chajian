@@ -30,6 +30,7 @@ const DEFAULT_CONFIG = {
   showProcessingInfo: false,
   enableLogging: false,
   enableTTS: true,
+  hideTtsMessageButtons: false,
   ttsProvider: 'browser',
   ttsApiUrl: '',
   ttsApiKey: '',
@@ -1299,6 +1300,12 @@ function bindEventListeners() {
     saveSettings();
   });
 
+  $(document).on('change', `#${MODULE_NAME}_hideTtsMessageButtons`, function () {
+    pluginConfig.hideTtsMessageButtons = $(this).prop('checked');
+    saveSettings();
+    queueNativeTtsButtonsRefresh(0);
+  });
+
   $(document).on('change', `#${MODULE_NAME}_ttsProvider`, function () {
     pluginConfig.ttsProvider = String($(this).val() || 'browser');
     const currentApiUrl = String(pluginConfig.ttsApiUrl || '').trim();
@@ -2458,6 +2465,12 @@ function createNativeTtsActionButton(action, title, iconClass) {
 function renderNativeTtsButtons() {
   if (typeof document === 'undefined' || typeof $ !== 'function') return;
 
+  if (pluginConfig.hideTtsMessageButtons) {
+    $('#chat .mes [data-sma-tts-action]').remove();
+    clearNativeTtsLongPress();
+    return;
+  }
+
   $('#chat .mes').each(function () {
     const $message = $(this);
     const messageId = normalizeMessageId($message.attr('mesid'));
@@ -3130,8 +3143,3 @@ try {
   exposeGlobalBridge();
 } catch (e) {}
 export { DocumentProcessor, FileProcessor, FileTypeDetector, FileValidator, ImageProcessor };
-
-
-
-
-
