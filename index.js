@@ -1024,6 +1024,17 @@ function createSettingsHTML() {
               </div>
             </div>
 
+            <div class="extension-content-item box-container">
+              <div class="flex flexFlowColumn">
+                <div class="settings-title-text">隐藏消息气泡中的 TTS 图标</div>
+                <div class="settings-title-description">暂时隐藏喇叭、引号、下载、暂停和停止图标，不影响 TTS 功能</div>
+              </div>
+              <div class="toggle-switch">
+                <input type="checkbox" id="${MODULE_NAME}_hideTtsMessageButtons" class="toggle-input" ${pluginConfig.hideTtsMessageButtons ? 'checked' : ''} />
+                <label for="${MODULE_NAME}_hideTtsMessageButtons" class="toggle-label"><span class="toggle-handle"></span></label>
+              </div>
+            </div>
+
             <div class="extension-content-item sma-stack">
               <div class="flex flexFlowColumn">
                 <div class="settings-title-text">TTS 提供商</div>
