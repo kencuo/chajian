@@ -1051,6 +1051,7 @@ function createSettingsHTML() {
                 <div class="settings-title-text">TTS 提供商</div>
                 <select id="${MODULE_NAME}_ttsProvider" class="text_pole sma-field">
                   <option value="browser" ${ttsProvider === 'browser' ? 'selected' : ''}>浏览器系统语音</option>
+                  <option value="windows-local" ${ttsProvider === 'windows-local' ? 'selected' : ''}>Windows 本机语音（可接 RVC）</option>
                   <option value="minimax" ${ttsProvider === 'minimax' ? 'selected' : ''}>MiniMax HTTP TTS</option>
                   <option value="openai-compatible" ${ttsProvider === 'openai-compatible' ? 'selected' : ''}>OpenAI 兼容 TTS</option>
                 </select>
@@ -1248,6 +1249,7 @@ function bindCollapsibleEvents() {
 function syncTtsFormState() {
   const provider = pluginConfig.ttsProvider || 'browser';
   const isBrowser = provider === 'browser';
+  const isWindowsLocal = provider === 'windows-local';
   const isMiniMax = provider === 'minimax';
   const remoteSelectors = [
     `#${MODULE_NAME}_ttsApiUrl`,
@@ -1260,7 +1262,7 @@ function syncTtsFormState() {
     `#${MODULE_NAME}_ttsPitch`,
   ];
 
-  remoteSelectors.forEach((selector) => $(selector).prop('disabled', isBrowser || !pluginConfig.enableTTS));
+  remoteSelectors.forEach((selector) => $(selector).prop('disabled', isBrowser || isWindowsLocal || !pluginConfig.enableTTS));
   $(`#${MODULE_NAME}_ttsMiniMaxHost`).prop('disabled', !isMiniMax || !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsGroupId`).prop('disabled', !isMiniMax || !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsTestBtn`).prop('disabled', !pluginConfig.enableTTS);
@@ -1276,6 +1278,8 @@ function syncTtsFormState() {
       'MiniMax 需要 API Key 和 Group ID；生成的语音会保存在浏览器中，消息喇叭长按可重新生成。';
   } else if (provider === 'openai-compatible') {
     helpText = '填写完整的 /audio/speech 地址；生成的语音会保存在浏览器中，消息喇叭长按可重新生成。';
+  } else if (provider === 'windows-local') {
+    helpText = '通过本机 RVC 服务的 /synthesize 端点使用 Windows 英文系统语音；无需 TTS 账号，之后可自动转换成 Connor。';
   }
 
   $(`#${MODULE_NAME}_ttsRemoteHint`).text(helpText);
@@ -2210,7 +2214,9 @@ async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
     let source =
       provider === 'minimax'
         ? await synthesizeMiniMaxSpeech(text)
-        : await synthesizeOpenAICompatibleSpeech(text);
+        : provider === 'windows-local'
+          ? await synthesizeWindowsLocalSpeech(text)
+          : await synthesizeOpenAICompatibleSpeech(text);
     if (pluginConfig.enableRvcConversion) {
       source = await convertAudioWithRvc(source.blob);
     }
@@ -2253,6 +2259,26 @@ async function convertAudioWithRvc(inputBlob) {
   if (blob.type && !blob.type.startsWith('audio/') && blob.type !== 'application/octet-stream') {
     throw new Error(`RVC 服务返回的不是音频文件（${blob.type}）`);
   }
+  return { blob };
+}
+
+async function synthesizeWindowsLocalSpeech(text) {
+  const rvcEndpoint = String(pluginConfig.rvcApiUrl || '').trim();
+  if (!rvcEndpoint) throw new Error('Windows 本机语音需要先填写 RVC API 地址');
+  const endpoint = rvcEndpoint.replace(/\/convert(?:\?.*)?$/i, '/synthesize');
+  const headers = { 'Content-Type': 'application/json' };
+  if (pluginConfig.rvcApiKey) headers.Authorization = `Bearer ${String(pluginConfig.rvcApiKey).trim()}`;
+  let response;
+  try {
+    response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ text }) });
+  } catch (error) {
+    throw new Error(`无法连接 Windows 本机语音接口，请检查地址、HTTPS 和跨域设置：${error.message || error}`);
+  }
+  if (!response.ok) {
+    throw new Error(await parseRemoteError(response, 'Windows 本机语音合成失败'));
+  }
+  const blob = await response.blob();
+  if (!blob.size) throw new Error('Windows 本机语音接口返回了空音频');
   return { blob };
 }
 
@@ -2306,6 +2332,9 @@ async function speakTextWithConfiguredProvider(text, options = {}) {
     }
     playViaBrowserSpeech(cleanText);
     return { success: true, provider, mode: 'browser' };
+  }
+  if (provider === 'windows-local' && !pluginConfig.enableRvcConversion) {
+    // Local speech synthesis is served by the same protected endpoint used for RVC.
   }
 
   const source = await getOrCreateRemoteTtsAudio(cleanText, provider, options);
