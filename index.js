@@ -43,6 +43,12 @@ const DEFAULT_CONFIG = {
   ttsVolume: 1,
   ttsPitch: 0,
   ttsTestText: '你好，这是一段 TTS 试听内容。',
+  enableRvcConversion: false,
+  rvcApiUrl: '',
+  rvcApiKey: '',
+  rvcVoiceName: 'ConnorDetroit_365e_10220s',
+  rvcPitch: 0,
+  rvcIndexRate: 0.75,
 
   // 内部配置
   supportedImageTypes: ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'],
@@ -916,6 +922,11 @@ function createSettingsHTML() {
   const ttsVolume = escapeHtmlAttr(String(coerceNumber(pluginConfig.ttsVolume, 1)));
   const ttsPitch = escapeHtmlAttr(String(coerceNumber(pluginConfig.ttsPitch, 0)));
   const ttsTestText = escapeHtmlAttr(pluginConfig.ttsTestText || '你好，这是一段 TTS 试听内容。');
+  const rvcApiUrl = escapeHtmlAttr(pluginConfig.rvcApiUrl || '');
+  const rvcApiKey = escapeHtmlAttr(pluginConfig.rvcApiKey || '');
+  const rvcVoiceName = escapeHtmlAttr(pluginConfig.rvcVoiceName || 'ConnorDetroit_365e_10220s');
+  const rvcPitch = escapeHtmlAttr(String(coerceNumber(pluginConfig.rvcPitch, 0)));
+  const rvcIndexRate = escapeHtmlAttr(String(coerceNumber(pluginConfig.rvcIndexRate, 0.75)));
 
   // 复用 SillyTavern/JS‑Slash‑Runner 的外观结构
   return `
@@ -1120,6 +1131,18 @@ function createSettingsHTML() {
               </div>
             </div>
 
+            <div class="extension-content-item sma-stack">
+              <label class="checkbox_label"><input type="checkbox" id="${MODULE_NAME}_enableRvcConversion" ${pluginConfig.enableRvcConversion ? 'checked' : ''} /><span>启用 RVC 音色转换（需要本机 RVC API）</span></label>
+              <div class="sma-stack">
+                <div><label class="sma-label" for="${MODULE_NAME}_rvcApiUrl">RVC API 地址</label><input type="url" id="${MODULE_NAME}_rvcApiUrl" class="text_pole sma-field" value="${rvcApiUrl}" placeholder="https://你的安全隧道地址/convert" /></div>
+                <div><label class="sma-label" for="${MODULE_NAME}_rvcApiKey">RVC API 密钥（可选）</label><input type="password" id="${MODULE_NAME}_rvcApiKey" class="text_pole sma-field" value="${rvcApiKey}" /></div>
+                <div><label class="sma-label" for="${MODULE_NAME}_rvcVoiceName">模型/音色名</label><input type="text" id="${MODULE_NAME}_rvcVoiceName" class="text_pole sma-field" value="${rvcVoiceName}" /></div>
+                <div><label class="sma-label" for="${MODULE_NAME}_rvcPitch">变调（半音）</label><input type="number" id="${MODULE_NAME}_rvcPitch" class="text_pole sma-field" value="${rvcPitch}" step="1" /></div>
+                <div><label class="sma-label" for="${MODULE_NAME}_rvcIndexRate">Index 比例（0–1）</label><input type="number" id="${MODULE_NAME}_rvcIndexRate" class="text_pole sma-field" value="${rvcIndexRate}" min="0" max="1" step="0.05" /></div>
+                <div class="settings-title-description">服务需接收 multipart/form-data：audio、voice、pitch、index_rate，并返回转换后的音频文件。</div>
+              </div>
+            </div>
+
             <div class="extension-content-item sma-stack sma-tts-cache-library">
               <div class="sma-tts-cache-heading">
                 <div>
@@ -1242,6 +1265,10 @@ function syncTtsFormState() {
   $(`#${MODULE_NAME}_ttsGroupId`).prop('disabled', !isMiniMax || !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsTestBtn`).prop('disabled', !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsStopBtn`).prop('disabled', !pluginConfig.enableTTS);
+  const rvcDisabled = !pluginConfig.enableTTS || !pluginConfig.enableRvcConversion;
+  ['rvcApiUrl', 'rvcApiKey', 'rvcVoiceName', 'rvcPitch', 'rvcIndexRate'].forEach((name) =>
+    $(`#${MODULE_NAME}_${name}`).prop('disabled', rvcDisabled),
+  );
 
   let helpText = '浏览器系统语音不需要接口配置，但不会产生可缓存或下载的音频文件。';
   if (provider === 'minimax') {
@@ -1394,6 +1421,32 @@ function bindEventListeners() {
 
   $(document).on('input change', `#${MODULE_NAME}_ttsTestText`, function () {
     pluginConfig.ttsTestText = String($(this).val() || '');
+    saveSettings();
+  });
+
+  $(document).on('change', `#${MODULE_NAME}_enableRvcConversion`, function () {
+    pluginConfig.enableRvcConversion = $(this).prop('checked');
+    syncTtsFormState();
+    saveSettings();
+  });
+  $(document).on('input change', `#${MODULE_NAME}_rvcApiUrl`, function () {
+    pluginConfig.rvcApiUrl = String($(this).val() || '').trim();
+    saveSettings();
+  });
+  $(document).on('input change', `#${MODULE_NAME}_rvcApiKey`, function () {
+    pluginConfig.rvcApiKey = String($(this).val() || '').trim();
+    saveSettings();
+  });
+  $(document).on('input change', `#${MODULE_NAME}_rvcVoiceName`, function () {
+    pluginConfig.rvcVoiceName = String($(this).val() || '').trim();
+    saveSettings();
+  });
+  $(document).on('input change', `#${MODULE_NAME}_rvcPitch`, function () {
+    pluginConfig.rvcPitch = coerceNumber($(this).val(), 0);
+    saveSettings();
+  });
+  $(document).on('input change', `#${MODULE_NAME}_rvcIndexRate`, function () {
+    pluginConfig.rvcIndexRate = Math.min(1, Math.max(0, coerceNumber($(this).val(), 0.75)));
     saveSettings();
   });
 
@@ -1810,6 +1863,15 @@ function getTtsCacheDescriptor(text, provider) {
     speed: coerceNumber(pluginConfig.ttsSpeed, 1),
     volume: coerceNumber(pluginConfig.ttsVolume, 1),
     pitch: coerceNumber(pluginConfig.ttsPitch, 0),
+    rvc: pluginConfig.enableRvcConversion
+      ? {
+          enabled: true,
+          apiUrl: String(pluginConfig.rvcApiUrl || '').trim(),
+          voice: String(pluginConfig.rvcVoiceName || '').trim(),
+          pitch: coerceNumber(pluginConfig.rvcPitch, 0),
+          indexRate: coerceNumber(pluginConfig.rvcIndexRate, 0.75),
+        }
+      : null,
   });
   return {
     key: `${provider}:${getStringHash(signature)}`,
@@ -2145,10 +2207,13 @@ async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
   }
 
   const createAudio = async () => {
-    const source =
+    let source =
       provider === 'minimax'
         ? await synthesizeMiniMaxSpeech(text)
         : await synthesizeOpenAICompatibleSpeech(text);
+    if (pluginConfig.enableRvcConversion) {
+      source = await convertAudioWithRvc(source.blob);
+    }
     const cacheSaved = await writeCachedTtsAudio(descriptor, source.blob, provider);
     return { blob: source.blob, cacheHit: false, cacheSaved, descriptor };
   };
@@ -2159,6 +2224,36 @@ async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
     ttsCacheState.pendingSynthesis.set(descriptor.key, pending);
   }
   return await ttsCacheState.pendingSynthesis.get(descriptor.key);
+}
+
+async function convertAudioWithRvc(inputBlob) {
+  const endpoint = String(pluginConfig.rvcApiUrl || '').trim();
+  if (!endpoint) throw new Error('已启用 RVC，但尚未填写 RVC API 地址');
+  const form = new FormData();
+  const mime = inputBlob.type || 'audio/mpeg';
+  const ext = /wav/i.test(mime) ? 'wav' : /ogg/i.test(mime) ? 'ogg' : 'mp3';
+  form.append('audio', inputBlob, `tts-input.${ext}`);
+  form.append('voice', String(pluginConfig.rvcVoiceName || 'ConnorDetroit_365e_10220s').trim());
+  form.append('pitch', String(coerceNumber(pluginConfig.rvcPitch, 0)));
+  form.append('index_rate', String(Math.min(1, Math.max(0, coerceNumber(pluginConfig.rvcIndexRate, 0.75)))));
+  const headers = {};
+  if (pluginConfig.rvcApiKey) headers.Authorization = `Bearer ${String(pluginConfig.rvcApiKey).trim()}`;
+  let response;
+  try {
+    response = await fetch(endpoint, { method: 'POST', headers, body: form });
+  } catch (error) {
+    throw new Error(`无法连接 RVC 服务，请检查地址、HTTPS 和跨域设置：${error.message || error}`);
+  }
+  if (!response.ok) {
+    const detail = (await response.text().catch(() => '')).slice(0, 400);
+    throw new Error(`RVC 转换失败（HTTP ${response.status}）${detail ? `：${detail}` : ''}`);
+  }
+  const blob = await response.blob();
+  if (!blob.size) throw new Error('RVC 服务返回了空音频');
+  if (blob.type && !blob.type.startsWith('audio/') && blob.type !== 'application/octet-stream') {
+    throw new Error(`RVC 服务返回的不是音频文件（${blob.type}）`);
+  }
+  return { blob };
 }
 
 async function playRemoteTtsAudio(source) {
@@ -2206,6 +2301,9 @@ async function speakTextWithConfiguredProvider(text, options = {}) {
   }
 
   if (provider === 'browser') {
+    if (pluginConfig.enableRvcConversion) {
+      throw new Error('RVC 音色转换需要音频型 TTS，请先将 TTS 提供商切换为 MiniMax 或 OpenAI 兼容');
+    }
     playViaBrowserSpeech(cleanText);
     return { success: true, provider, mode: 'browser' };
   }
