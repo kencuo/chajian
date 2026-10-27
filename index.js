@@ -31,6 +31,7 @@ const DEFAULT_CONFIG = {
   enableLogging: false,
   enableTTS: true,
   hideTtsMessageButtons: false,
+  enableInlineQuoteTts: true,
   ttsProvider: 'browser',
   ttsApiUrl: '',
   ttsApiKey: '',
@@ -1048,6 +1049,8 @@ function createSettingsHTML() {
 
             <div class="extension-content-item sma-stack">
               <div class="flex flexFlowColumn">
+                <label class="checkbox_label"><input type="checkbox" id="${MODULE_NAME}_enableInlineQuoteTts" ${pluginConfig.enableInlineQuoteTts ? 'checked' : ''} /><span>在每段对白旁显示语音按钮</span></label>
+                <div class="settings-title-description">点击结束引号旁的小喇叭，只生成并播放这一段对白；再次点击播放缓存。支持英文双引号、中文双引号和「」『』。</div>
                 <div class="settings-title-text">TTS 提供商</div>
                 <select id="${MODULE_NAME}_ttsProvider" class="text_pole sma-field">
                   <option value="browser" ${ttsProvider === 'browser' ? 'selected' : ''}>浏览器系统语音</option>
@@ -1339,7 +1342,14 @@ function bindEventListeners() {
   $(document).on('change', `#${MODULE_NAME}_enableTTS`, function () {
     pluginConfig.enableTTS = $(this).prop('checked');
     syncTtsFormState();
+    queueNativeTtsButtonsRefresh(0);
     saveSettings();
+  });
+
+  $(document).on('change', `#${MODULE_NAME}_enableInlineQuoteTts`, function () {
+    pluginConfig.enableInlineQuoteTts = $(this).prop('checked');
+    saveSettings();
+    queueNativeTtsButtonsRefresh(0);
   });
 
   $(document).on('change', `#${MODULE_NAME}_hideTtsMessageButtons`, function () {
@@ -2614,11 +2624,73 @@ function createNativeTtsActionButton(action, title, iconClass) {
   `);
 }
 
+// Keep metadata out of message HTML and do not rewrite rendered Markdown.
+const inlineQuoteTtsSnapshots = new WeakMap();
+
+function findInlineTtsQuotes(text) {
+  const matches = [];
+  const pattern = /"([^"\u0000]+)"|“([^”\u0000]+)”|「([^」\u0000]+)」|『([^』\u0000]+)』|＂([^＂\u0000]+)＂/gu;
+  for (const match of text.matchAll(pattern)) {
+    const dialogue = match.slice(1).find((value) => value !== undefined).trim();
+    if (dialogue) matches.push({ text: dialogue, end: match.index + match[0].length });
+  }
+  return matches;
+}
+
+function renderInlineQuoteTtsButtons(root) {
+  const enabled = pluginConfig.enableTTS && pluginConfig.enableInlineQuoteTts;
+  const existing = [...root.querySelectorAll('.sma-inline-quote-tts')];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let text = '';
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    if (node.parentElement.closest('.sma-inline-quote-tts')) continue;
+    // Excluded regions form boundaries, so quotes cannot span a code block.
+    if (node.parentElement.closest('script,style,pre,code,textarea,button,a,[contenteditable="true"],[hidden]')) {
+      text += '\u0000';
+      continue;
+    }
+    nodes.push({ node, start: text.length, end: text.length + node.data.length });
+    text += node.data;
+  }
+  const snapshot = inlineQuoteTtsSnapshots.get(root);
+  if (snapshot?.text === text && snapshot.enabled === enabled && snapshot.count === existing.length) return;
+  existing.forEach((button) => button.remove());
+  const quotes = enabled ? findInlineTtsQuotes(text) : [];
+  // Work backwards: splitting a later text node must not shift earlier offsets.
+  for (const quote of [...quotes].reverse()) {
+    const entry = nodes.find(({ start, end }) => quote.end > start && quote.end <= end);
+    if (!entry) continue;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sma-inline-quote-tts';
+    button.dataset.smaTtsAction = 'inline-quote';
+    button.smaQuoteText = quote.text;
+    button.title = '只播放这段对白（长按重新生成）';
+    button.setAttribute('aria-label', '生成并播放这段对白');
+    const icon = document.createElement('i');
+    icon.className = 'fa-solid fa-volume-low';
+    icon.setAttribute('aria-hidden', 'true');
+    button.append(icon);
+    const range = document.createRange();
+    range.setStart(entry.node, quote.end - entry.start);
+    range.collapse(true);
+    range.insertNode(button);
+  }
+  inlineQuoteTtsSnapshots.set(root, { text, enabled, count: quotes.length });
+}
+
 function renderNativeTtsButtons() {
   if (typeof document === 'undefined' || typeof $ !== 'function') return;
 
+  $('#chat .mes .mes_text').each(function () {
+    const message = getChatMessageById($(this).closest('.mes').attr('mesid'));
+    if (message && !message.is_system) renderInlineQuoteTtsButtons(this);
+  });
+
   if (pluginConfig.hideTtsMessageButtons) {
-    $('#chat .mes [data-sma-tts-action]').remove();
+    $('#chat .mes .extraMesButtons [data-sma-tts-action]').remove();
     clearNativeTtsLongPress();
     return;
   }
@@ -2691,6 +2763,24 @@ async function runNativeTtsAction(triggerElement, options = {}) {
   const messageId = rememberNativeTtsMessageId($target.closest('.mes').attr('mesid'));
   const forceRegenerate = !!options.forceRegenerate;
 
+  if (action === 'inline-quote') {
+    if (triggerElement.disabled) return;
+    const text = sanitizeTtsText(triggerElement.smaQuoteText || '');
+    if (!text) throw new Error('这段对白没有可朗读的文本');
+    triggerElement.disabled = true;
+    triggerElement.setAttribute('aria-busy', 'true');
+    const icon = triggerElement.querySelector('i');
+    if (icon) icon.className = 'fa-solid fa-spinner fa-spin';
+    try {
+      await speakTextWithConfiguredProvider(text, { source: 'inline-quote', forceRegenerate });
+    } finally {
+      triggerElement.disabled = false;
+      triggerElement.removeAttribute('aria-busy');
+      if (icon) icon.className = 'fa-solid fa-volume-low';
+    }
+    return;
+  }
+
   closeNativeTtsActions(triggerElement);
 
   if (action === 'pause') {
@@ -2750,7 +2840,7 @@ function bindNativeTtsMenuEvents() {
 
   $(document).on(
     'pointerdown.smaTtsNative',
-    '[data-sma-tts-action="content"], [data-sma-tts-action="quote"]',
+    '[data-sma-tts-action="content"], [data-sma-tts-action="quote"], [data-sma-tts-action="inline-quote"]',
     function (event) {
       if (event.pointerType === 'mouse' && event.button !== 0) return;
       clearNativeTtsLongPress();
@@ -2773,7 +2863,7 @@ function bindNativeTtsMenuEvents() {
 
   $(document).on(
     'pointerup.smaTtsNative pointercancel.smaTtsNative pointerleave.smaTtsNative',
-    '[data-sma-tts-action="content"], [data-sma-tts-action="quote"]',
+    '[data-sma-tts-action="content"], [data-sma-tts-action="quote"], [data-sma-tts-action="inline-quote"]',
     function () {
       if (nativeTtsIntegrationState.longPressTarget === this) clearNativeTtsLongPress();
     },
@@ -2781,7 +2871,7 @@ function bindNativeTtsMenuEvents() {
 
   $(document).on(
     'contextmenu.smaTtsNative',
-    '[data-sma-tts-action="content"], [data-sma-tts-action="quote"]',
+    '[data-sma-tts-action="content"], [data-sma-tts-action="quote"], [data-sma-tts-action="inline-quote"]',
     (event) => event.preventDefault(),
   );
 
