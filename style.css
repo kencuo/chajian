@@ -439,6 +439,39 @@
     opacity 0.15s ease;
 }
 
+/* A small reserved inline slot keeps the control clear of dialogue and prose. */
+#chat .mes_text .sma-inline-quote-tts {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: super;
+  width: 1.35em;
+  height: 1.35em;
+  margin: 0 0.2em 0 0.1em;
+  padding: 0;
+  border: 0;
+  border-radius: 0.3em;
+  background: transparent;
+  color: inherit;
+  font-size: 0.75em;
+  line-height: 1;
+  opacity: 0.65;
+  cursor: pointer;
+  user-select: none;
+}
+
+#chat .mes_text .sma-inline-quote-tts:hover,
+#chat .mes_text .sma-inline-quote-tts:focus-visible {
+  opacity: 1;
+  background: var(--SmartThemeBlurTintColor, rgba(128, 128, 128, 0.15));
+  outline: 1px solid currentColor;
+}
+
+#chat .mes_text .sma-inline-quote-tts:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
 #smart-media-assistant-settings .sma-tts-cache-library {
   min-width: 0;
 }
