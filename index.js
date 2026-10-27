@@ -1136,7 +1136,7 @@ function createSettingsHTML() {
               <label class="checkbox_label"><input type="checkbox" id="${MODULE_NAME}_enableRvcConversion" ${pluginConfig.enableRvcConversion ? 'checked' : ''} /><span>启用 RVC 音色转换（需要本机 RVC API）</span></label>
               <div class="sma-stack">
                 <div><label class="sma-label" for="${MODULE_NAME}_rvcApiUrl">RVC API 地址</label><input type="url" id="${MODULE_NAME}_rvcApiUrl" class="text_pole sma-field" value="${rvcApiUrl}" placeholder="https://你的安全隧道地址/convert" /></div>
-                <div><label class="sma-label" for="${MODULE_NAME}_rvcApiKey">RVC API 密钥（可选）</label><input type="password" id="${MODULE_NAME}_rvcApiKey" class="text_pole sma-field" value="${rvcApiKey}" /></div>
+                <div><label class="sma-label" for="${MODULE_NAME}_rvcApiKey">RVC API 密钥</label><input type="password" id="${MODULE_NAME}_rvcApiKey" class="text_pole sma-field" value="${rvcApiKey}" /></div>
                 <div><label class="sma-label" for="${MODULE_NAME}_rvcVoiceName">模型/音色名</label><input type="text" id="${MODULE_NAME}_rvcVoiceName" class="text_pole sma-field" value="${rvcVoiceName}" /></div>
                 <div><label class="sma-label" for="${MODULE_NAME}_rvcPitch">变调（半音）</label><input type="number" id="${MODULE_NAME}_rvcPitch" class="text_pole sma-field" value="${rvcPitch}" step="1" /></div>
                 <div><label class="sma-label" for="${MODULE_NAME}_rvcIndexRate">Index 比例（0–1）</label><input type="number" id="${MODULE_NAME}_rvcIndexRate" class="text_pole sma-field" value="${rvcIndexRate}" min="0" max="1" step="0.05" /></div>
@@ -1279,7 +1279,7 @@ function syncTtsFormState() {
   } else if (provider === 'openai-compatible') {
     helpText = '填写完整的 /audio/speech 地址；生成的语音会保存在浏览器中，消息喇叭长按可重新生成。';
   } else if (provider === 'windows-local') {
-    helpText = '通过本机 RVC 服务的 /synthesize 端点使用 Windows 英文系统语音；无需 TTS 账号，之后可自动转换成 Connor。';
+    helpText = '通过本机 RVC 服务的 /synthesize 端点使用 Windows 英文系统语音；无需 TTS 账号。请输入英文测试文本，并启用 RVC 转换以输出 Connor 音色。';
   }
 
   $(`#${MODULE_NAME}_ttsRemoteHint`).text(helpText);
@@ -1854,7 +1854,9 @@ function runTtsCacheTransaction(mode, operation) {
 }
 
 function getTtsCacheDescriptor(text, provider) {
-  const format = String(pluginConfig.ttsFormat || 'mp3').trim().toLowerCase() || 'mp3';
+  const format = provider === 'windows-local'
+    ? 'wav'
+    : String(pluginConfig.ttsFormat || 'mp3').trim().toLowerCase() || 'mp3';
   const signature = JSON.stringify({
     version: 1,
     text,
@@ -1999,7 +2001,11 @@ async function renderTtsCacheLibrary() {
         const fullText = String(metadata.text || '未记录文本').replace(/\s+/g, ' ').trim();
         const text = fullText.length > 160 ? `${fullText.slice(0, 160)}…` : fullText;
         const title = fullText.length > 500 ? `${fullText.slice(0, 500)}…` : fullText;
-        const provider = record.provider === 'minimax' ? 'MiniMax' : 'OpenAI 兼容';
+        const provider = record.provider === 'minimax'
+          ? 'MiniMax'
+          : record.provider === 'windows-local'
+            ? 'Windows 本机语音'
+            : 'OpenAI 兼容';
         const voice = String(metadata.voiceId || '').trim();
         const meta = [provider, voice, String(record.format || 'mp3').toUpperCase(), formatTtsCacheSize(record.blob?.size)]
           .filter(Boolean)
@@ -2265,7 +2271,15 @@ async function convertAudioWithRvc(inputBlob) {
 async function synthesizeWindowsLocalSpeech(text) {
   const rvcEndpoint = String(pluginConfig.rvcApiUrl || '').trim();
   if (!rvcEndpoint) throw new Error('Windows 本机语音需要先填写 RVC API 地址');
-  const endpoint = rvcEndpoint.replace(/\/convert(?:\?.*)?$/i, '/synthesize');
+  let endpoint;
+  try {
+    const url = new URL(rvcEndpoint, window.location.href);
+    const path = url.pathname.replace(/\/+$/, '');
+    url.pathname = /\/convert$/i.test(path) ? path.replace(/\/convert$/i, '/synthesize') : `${path}/synthesize`;
+    endpoint = url.toString();
+  } catch (error) {
+    throw new Error('RVC API 地址格式不正确');
+  }
   const headers = { 'Content-Type': 'application/json' };
   if (pluginConfig.rvcApiKey) headers.Authorization = `Bearer ${String(pluginConfig.rvcApiKey).trim()}`;
   let response;
@@ -2328,13 +2342,13 @@ async function speakTextWithConfiguredProvider(text, options = {}) {
 
   if (provider === 'browser') {
     if (pluginConfig.enableRvcConversion) {
-      throw new Error('RVC 音色转换需要音频型 TTS，请先将 TTS 提供商切换为 MiniMax 或 OpenAI 兼容');
+      throw new Error('RVC 音色转换需要音频型 TTS，请切换为 Windows 本机语音、MiniMax 或 OpenAI 兼容');
     }
     playViaBrowserSpeech(cleanText);
     return { success: true, provider, mode: 'browser' };
   }
   if (provider === 'windows-local' && !pluginConfig.enableRvcConversion) {
-    // Local speech synthesis is served by the same protected endpoint used for RVC.
+    throw new Error('Windows 本机语音路线需要勾选“启用 RVC 音色转换”，才能输出 Connor 音色');
   }
 
   const source = await getOrCreateRemoteTtsAudio(cleanText, provider, options);
