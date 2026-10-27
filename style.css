@@ -458,6 +458,19 @@
   opacity: 0.65;
   cursor: pointer;
   user-select: none;
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+}
+
+#chat .mes_text .sma-inline-quote-tts > i {
+  pointer-events: none;
+}
+
+@media (pointer: coarse) {
+  #chat .mes_text .sma-inline-quote-tts {
+    min-width: 32px;
+    min-height: 32px;
+  }
 }
 
 #chat .mes_text .sma-inline-quote-tts:hover,
