@@ -2828,9 +2828,31 @@ async function runNativeTtsAction(triggerElement, options = {}) {
   }
 }
 
+// Handle quote controls before message-level handlers can consume mobile clicks.
+// Keep click as the activation event so keyboard activation also works and a
+// touch gesture cannot generate both a pointer-up and a click request.
+async function handleInlineQuoteTtsClick(event) {
+  const target = event.target?.closest?.('.sma-inline-quote-tts');
+  if (!target || !target.closest('#chat .mes_text')) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (target.disabled) return;
+  clearNativeTtsLongPress();
+  if (target.getAttribute('data-sma-long-press-handled') === 'true') {
+    target.removeAttribute('data-sma-long-press-handled');
+    return;
+  }
+  try {
+    await runNativeTtsAction(target);
+  } catch (error) {
+    showTtsToast(getFriendlyFetchErrorMessage(error, pluginConfig.ttsProvider), 'error');
+  }
+}
+
 function bindNativeTtsMenuEvents() {
   if (nativeTtsIntegrationState.domEventsBound || typeof $ !== 'function') return;
   nativeTtsIntegrationState.domEventsBound = true;
+  document.addEventListener('click', handleInlineQuoteTtsClick, true);
 
   $(document).off('.smaTtsNative');
 
