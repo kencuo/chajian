@@ -2248,6 +2248,16 @@ async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
   return await ttsCacheState.pendingSynthesis.get(descriptor.key);
 }
 
+function describeRvcConnectionFailure(endpoint, error) {
+  // Never include URL credentials, query strings or the API key in a toast.
+  let address = '地址无法解析';
+  try {
+    const url = new URL(endpoint, window.location.href);
+    address = `${url.protocol}//${url.host}${url.pathname}`;
+  } catch (_) {}
+  return `请求地址：${address}；页面连接：${window.location.protocol === 'https:' ? 'HTTPS' : '非 HTTPS'}。浏览器未取得接口响应，请核对手机保存的接口地址，并检查此浏览器的代理或网络访问限制。${error?.message || error || ''}`;
+}
+
 async function convertAudioWithRvc(inputBlob) {
   const endpoint = String(pluginConfig.rvcApiUrl || '').trim();
   if (!endpoint) throw new Error('已启用 RVC，但尚未填写 RVC API 地址');
@@ -2264,7 +2274,7 @@ async function convertAudioWithRvc(inputBlob) {
   try {
     response = await fetch(endpoint, { method: 'POST', headers, body: form });
   } catch (error) {
-    throw new Error(`无法连接 RVC 服务，请检查地址、HTTPS 和跨域设置：${error.message || error}`);
+    throw new Error(`无法连接 RVC 服务。${describeRvcConnectionFailure(endpoint, error)}`);
   }
   if (!response.ok) {
     const detail = (await response.text().catch(() => '')).slice(0, 400);
@@ -2296,7 +2306,7 @@ async function synthesizeWindowsLocalSpeech(text) {
   try {
     response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ text }) });
   } catch (error) {
-    throw new Error(`无法连接 Windows 本机语音接口，请检查地址、HTTPS 和跨域设置：${error.message || error}`);
+    throw new Error(`无法连接 Windows 本机语音接口。${describeRvcConnectionFailure(endpoint, error)}`);
   }
   if (!response.ok) {
     throw new Error(await parseRemoteError(response, 'Windows 本机语音合成失败'));
