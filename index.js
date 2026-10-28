@@ -2,7 +2,7 @@
  * 智能媒体助手 - SillyTavern Extension
  * 统一的图片和文档处理插件
  * 作者: ctrl
- * 版本: 1.5.3
+ * 版本: 1.5.4
  */
 
 import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
@@ -2288,12 +2288,18 @@ async function synthesizeOpenAICompatibleSpeech(text) {
 async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
   const descriptor = getTtsCacheDescriptor(text, provider);
   if (!options.forceRegenerate) {
+    // A finished generation remains reusable while its background save runs.
+    const inFlight = ttsCacheState.pendingSynthesis.get(descriptor.key);
+    if (inFlight) return await inFlight;
     const cachedBlob = await readCachedTtsAudio(descriptor);
+    const arrived = ttsCacheState.pendingSynthesis.get(descriptor.key);
+    if (arrived) return await arrived;
     if (cachedBlob) {
-      return { blob: cachedBlob, cacheHit: true, cacheSaved: true, descriptor };
+      return { blob: cachedBlob, cacheHit: true, cacheSaved: true, cachePending: false, descriptor };
     }
   }
 
+  let pending;
   const createAudio = async () => {
     let source =
       provider === 'minimax'
@@ -2304,16 +2310,39 @@ async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
     if (pluginConfig.enableRvcConversion && !source.rvcApplied) {
       source = await convertAudioWithRvc(source.blob);
     }
-    const cacheSaved = await writeCachedTtsAudio(descriptor, source.blob, provider);
-    return { blob: source.blob, cacheHit: false, cacheSaved, descriptor };
+    const result = { blob: source.blob, cacheHit: false, cacheSaved: false, cachePending: true, descriptor };
+    // Yield the ready audio to the player first. A later task persists it;
+    // neither a slow disk nor an IndexedDB failure may delay playback.
+    result.cacheSavePromise = new Promise((resolve) => {
+      setTimeout(async () => {
+        try {
+          if (ttsCacheState.pendingSynthesis.get(descriptor.key) !== pending) {
+            result.cacheSuperseded = true;
+            return;
+          }
+          result.cacheSaved = !!(await writeCachedTtsAudio(descriptor, source.blob, provider));
+        } catch (error) {
+          console.warn('[Smart Media Assistant] 语音已就绪，但后台保存缓存失败', error);
+        } finally {
+          result.cachePending = false;
+          if (ttsCacheState.pendingSynthesis.get(descriptor.key) === pending) {
+            ttsCacheState.pendingSynthesis.delete(descriptor.key);
+          }
+          resolve(result.cacheSaved);
+        }
+      }, 0);
+    });
+    return result;
   };
 
-  if (options.forceRegenerate) return await createAudio();
-  if (!ttsCacheState.pendingSynthesis.has(descriptor.key)) {
-    const pending = createAudio().finally(() => ttsCacheState.pendingSynthesis.delete(descriptor.key));
-    ttsCacheState.pendingSynthesis.set(descriptor.key, pending);
-  }
-  return await ttsCacheState.pendingSynthesis.get(descriptor.key);
+  pending = createAudio().catch((error) => {
+    if (ttsCacheState.pendingSynthesis.get(descriptor.key) === pending) {
+      ttsCacheState.pendingSynthesis.delete(descriptor.key);
+    }
+    throw error;
+  });
+  ttsCacheState.pendingSynthesis.set(descriptor.key, pending);
+  return await pending;
 }
 
 function getRvcRequestHeaders(endpoint, contentType) {
@@ -2496,6 +2525,7 @@ async function speakTextWithConfiguredProvider(text, options = {}) {
     pendingPlayback: !!playback?.pendingPlayback,
     cacheHit: source.cacheHit,
     cacheSaved: source.cacheSaved,
+    cachePending: !!source.cachePending,
   };
 }
 
@@ -2930,7 +2960,9 @@ async function runNativeTtsAction(triggerElement, options = {}) {
       ? '已下载浏览器中缓存的正文语音'
       : source.cacheSaved
         ? '语音已生成、保存并下载'
-        : '语音已生成并下载，但浏览器缓存保存失败';
+        : source.cachePending
+          ? '语音已生成并下载，正在后台保存缓存'
+          : '语音已生成并下载，但浏览器缓存保存失败';
     showTtsToast(message, source.cacheSaved ? 'success' : 'info');
     return;
   }
@@ -2946,13 +2978,15 @@ async function runNativeTtsAction(triggerElement, options = {}) {
     showTtsToast(`开始朗读${label}`, 'success');
   } else if (forceRegenerate) {
     showTtsToast(
-      result.cacheSaved ? `已重新生成、保存并播放${label}` : `已重新生成并播放${label}，但浏览器缓存保存失败`,
-      result.cacheSaved ? 'success' : 'info',
+      result.cacheSaved ? `已重新生成、保存并播放${label}` : result.cachePending ? `已重新生成并开始播放${label}，缓存正在后台保存` : `已重新生成并播放${label}，但浏览器缓存保存失败`,
+      result.cacheSaved || result.cachePending ? 'success' : 'info',
     );
   } else if (result.cacheHit) {
     showTtsToast(`正在播放浏览器中已缓存的${label}`, 'success');
   } else if (result.cacheSaved) {
     showTtsToast(`语音已生成、保存并开始播放${label}`, 'success');
+  } else if (result.cachePending) {
+    showTtsToast(`语音已开始播放${label}，缓存正在后台保存`, 'success');
   } else {
     showTtsToast(`语音已生成并开始播放，但浏览器缓存保存失败`, 'info');
   }
