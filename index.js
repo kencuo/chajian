@@ -2,7 +2,7 @@
  * 智能媒体助手 - SillyTavern Extension
  * 统一的图片和文档处理插件
  * 作者: ctrl
- * 版本: 1.5.0
+ * 版本: 1.5.3
  */
 
 import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
@@ -1466,11 +1466,11 @@ function bindEventListeners() {
 
   $(document).on('click', `#${MODULE_NAME}_ttsTestBtn`, async function () {
     try {
-      await speakTextWithConfiguredProvider(pluginConfig.ttsTestText || '你好，这是一段 TTS 试听内容。', {
+      const result = await speakTextWithConfiguredProvider(pluginConfig.ttsTestText || '你好，这是一段 TTS 试听内容。', {
         source: 'plugin-test',
       });
       if (typeof toastr !== 'undefined') {
-        toastr.success('TTS 已开始播放', '语音朗读');
+        if (!result.pendingPlayback) toastr.success('TTS 已开始播放', '语音朗读');
       }
     } catch (error) {
       if (typeof toastr !== 'undefined') {
@@ -1508,8 +1508,8 @@ function bindEventListeners() {
 
     try {
       if (action === 'play') {
-        await playRemoteTtsAudio({ blob: record.blob });
-        showTtsToast('正在播放缓存语音');
+        const playback = await playRemoteTtsAudio({ blob: record.blob });
+        if (!playback?.pendingPlayback) showTtsToast('正在播放缓存语音');
       } else if (action === 'download') {
         downloadTtsBlob(record.blob, getTtsCacheFilename(record));
       } else if (action === 'delete') {
@@ -1618,6 +1618,71 @@ function sanitizeTtsText(text) {
     .trim();
 }
 
+function clearTtsManualPlayer() {
+  const panel = document.getElementById('sma-tts-manual-player');
+  if (!panel) return;
+  const audio = ttsPlaybackState.audioElement;
+  if (audio && panel.contains(audio)) {
+    document.body.appendChild(audio);
+    audio.controls = false;
+    audio.style.display = 'none';
+  }
+  panel.remove();
+}
+
+function showTtsManualPlayer(audio) {
+  clearTtsManualPlayer();
+  const panel = document.createElement('div');
+  panel.id = 'sma-tts-manual-player';
+  panel.setAttribute('role', 'region');
+  panel.setAttribute('aria-label', '已生成语音播放器');
+  panel.style.cssText = 'position:fixed;left:12px;right:12px;bottom:calc(16px + env(safe-area-inset-bottom, 0px));z-index:2147483000;max-width:520px;margin:auto;padding:14px;border-radius:12px;background:#202531;color:#fff;box-shadow:0 4px 24px #0008;font:15px/1.5 system-ui,sans-serif;';
+  const label = document.createElement('div');
+  label.textContent = '语音已生成，点一下播放即可，无需重新生成。';
+  const play = document.createElement('button');
+  play.type = 'button';
+  play.textContent = '▶ 点此播放语音';
+  play.style.cssText = 'display:inline-block;min-height:44px;padding:8px 14px;margin:10px 8px 8px 0;border:0;border-radius:8px;background:#75c5ff;color:#102030;font:inherit;cursor:pointer;touch-action:manipulation;';
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.textContent = '关闭';
+  close.style.cssText = 'min-height:44px;padding:8px 12px;border:1px solid #aaa;border-radius:8px;background:transparent;color:inherit;font:inherit;';
+  close.addEventListener('click', () => stopSpeaking());
+  play.addEventListener('click', () => {
+    // Must call play synchronously within this fresh user gesture: no fetch,
+    // IndexedDB, timer or await may precede it.
+    try {
+      const started = audio.play();
+      if (started?.catch) started.catch(() => showTtsToast('请点击下方播放器自带的播放键；音频已保留', 'info'));
+    } catch (_) { showTtsToast('请点击下方播放器自带的播放键；音频已保留', 'info'); }
+  });
+  panel.append(label, play, close);
+  audio.controls = true;
+  audio.style.cssText = 'display:block;width:100%;margin-top:6px;';
+  panel.append(audio);
+  document.body.append(panel);
+  if (!audio.smaManualPlayerListeners) {
+    audio.smaManualPlayerListeners = true;
+    audio.addEventListener('playing', () => {
+      ttsPlaybackState.activeMode = 'audio';
+      ttsPlaybackState.isSpeaking = true;
+      updateNativeTtsPauseButtons(false);
+      const current = document.getElementById('sma-tts-manual-player');
+      if (current) {
+        current.firstChild.textContent = '正在播放语音';
+        current.querySelector('button').hidden = true;
+      }
+    });
+    audio.addEventListener('pause', () => {
+      if (document.getElementById('sma-tts-manual-player')) {
+        ttsPlaybackState.isSpeaking = false;
+        updateNativeTtsPauseButtons(true);
+      }
+    });
+  }
+  showTtsToast('语音已就绪，请点击屏幕下方的播放按钮', 'info');
+}
+
 function ensureTtsAudioElement() {
   if (ttsPlaybackState.audioElement) return ttsPlaybackState.audioElement;
   const audio = document.createElement('audio');
@@ -1625,6 +1690,7 @@ function ensureTtsAudioElement() {
   audio.preload = 'none';
   audio.style.display = 'none';
   audio.addEventListener('ended', () => {
+    clearTtsManualPlayer();
     ttsPlaybackState.isSpeaking = false;
     ttsPlaybackState.activeMode = '';
     updateNativeTtsPauseButtons(false);
@@ -1634,6 +1700,7 @@ function ensureTtsAudioElement() {
     }
   });
   audio.addEventListener('error', () => {
+    clearTtsManualPlayer();
     ttsPlaybackState.isSpeaking = false;
     ttsPlaybackState.activeMode = '';
     updateNativeTtsPauseButtons(false);
@@ -1648,6 +1715,7 @@ function ensureTtsAudioElement() {
 }
 
 function stopSpeaking() {
+  clearTtsManualPlayer();
   try {
     if (typeof speechSynthesis !== 'undefined') {
       speechSynthesis.cancel();
@@ -2233,7 +2301,7 @@ async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
         : provider === 'windows-local'
           ? await synthesizeWindowsLocalSpeech(text)
           : await synthesizeOpenAICompatibleSpeech(text);
-    if (pluginConfig.enableRvcConversion) {
+    if (pluginConfig.enableRvcConversion && !source.rvcApplied) {
       source = await convertAudioWithRvc(source.blob);
     }
     const cacheSaved = await writeCachedTtsAudio(descriptor, source.blob, provider);
@@ -2246,6 +2314,22 @@ async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
     ttsCacheState.pendingSynthesis.set(descriptor.key, pending);
   }
   return await ttsCacheState.pendingSynthesis.get(descriptor.key);
+}
+
+function getRvcRequestHeaders(endpoint, contentType) {
+  const url = new URL(endpoint, window.location.href);
+  const headers = {};
+  if (url.origin === window.location.origin) {
+    Object.assign(headers, getRequestHeaders());
+    // Multipart boundaries must be generated by the browser.
+    for (const name of Object.keys(headers)) {
+      if (name.toLowerCase() === 'content-type' || name.toLowerCase() === 'authorization') delete headers[name];
+    }
+  }
+  if (contentType) headers['Content-Type'] = contentType;
+  const isRelay = url.origin === window.location.origin && /^\/api\/plugins\/connor-rvc\//.test(url.pathname);
+  if (!isRelay && pluginConfig.rvcApiKey) headers.Authorization = `Bearer ${String(pluginConfig.rvcApiKey).trim()}`;
+  return headers;
 }
 
 function describeRvcConnectionFailure(endpoint, error) {
@@ -2268,8 +2352,7 @@ async function convertAudioWithRvc(inputBlob) {
   form.append('voice', String(pluginConfig.rvcVoiceName || 'ConnorDetroit_365e_10220s').trim());
   form.append('pitch', String(coerceNumber(pluginConfig.rvcPitch, 0)));
   form.append('index_rate', String(Math.min(1, Math.max(0, coerceNumber(pluginConfig.rvcIndexRate, 0.75)))));
-  const headers = {};
-  if (pluginConfig.rvcApiKey) headers.Authorization = `Bearer ${String(pluginConfig.rvcApiKey).trim()}`;
+  const headers = getRvcRequestHeaders(endpoint);
   let response;
   try {
     response = await fetch(endpoint, { method: 'POST', headers, body: form });
@@ -2288,7 +2371,33 @@ async function convertAudioWithRvc(inputBlob) {
   return { blob };
 }
 
+async function synthesizeViaConnorRelay(text) {
+  const url = new URL(String(pluginConfig.rvcApiUrl || '').trim(), window.location.href);
+  if (url.origin !== window.location.origin || url.pathname !== '/api/plugins/connor-rvc/convert') return null;
+  url.pathname = '/api/plugins/connor-rvc/speak';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 180000);
+  try {
+    const response = await fetch(url.toString(), {
+      method: 'POST', headers: getRvcRequestHeaders(url.toString(), 'application/json'), signal: controller.signal,
+      body: JSON.stringify({ text, voice: pluginConfig.rvcVoiceName || 'ConnorDetroit_365e_10220s', pitch: coerceNumber(pluginConfig.rvcPitch, 0), index_rate: coerceNumber(pluginConfig.rvcIndexRate, 0.75) }),
+    });
+    if (!response.ok) throw new Error(await parseRemoteError(response, '服务器语音生成失败'));
+    const payload = await response.json();
+    if (typeof payload.audioBase64 !== 'string' || !payload.audioBase64 || payload.mimeType !== 'audio/wav') throw new Error('中转未返回有效的康纳音频');
+    const binary = atob(payload.audioBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return { blob: new Blob([bytes], { type: 'audio/wav' }), rvcApplied: true };
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('康纳语音生成超过 180 秒，请用一句短英文重试');
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+
 async function synthesizeWindowsLocalSpeech(text) {
+  const combined = await synthesizeViaConnorRelay(text);
+  if (combined) return combined;
   const rvcEndpoint = String(pluginConfig.rvcApiUrl || '').trim();
   if (!rvcEndpoint) throw new Error('Windows 本机语音需要先填写 RVC API 地址');
   let endpoint;
@@ -2300,8 +2409,7 @@ async function synthesizeWindowsLocalSpeech(text) {
   } catch (error) {
     throw new Error('RVC API 地址格式不正确');
   }
-  const headers = { 'Content-Type': 'application/json' };
-  if (pluginConfig.rvcApiKey) headers.Authorization = `Bearer ${String(pluginConfig.rvcApiKey).trim()}`;
+  const headers = getRvcRequestHeaders(endpoint, 'application/json');
   let response;
   try {
     response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ text }) });
@@ -2330,6 +2438,13 @@ async function playRemoteTtsAudio(source) {
     await audio.play();
     updateNativeTtsPauseButtons(false);
   } catch (error) {
+    if (error?.name === 'NotAllowedError' || /not allowed by.*user agent|user gesture|user interaction/i.test(String(error?.message || ''))) {
+      ttsPlaybackState.activeMode = 'audio';
+      ttsPlaybackState.isSpeaking = false;
+      updateNativeTtsPauseButtons(true);
+      showTtsManualPlayer(audio);
+      return { pendingPlayback: true };
+    }
     if (ttsPlaybackState.currentObjectUrl) {
       URL.revokeObjectURL(ttsPlaybackState.currentObjectUrl);
       ttsPlaybackState.currentObjectUrl = '';
@@ -2373,11 +2488,12 @@ async function speakTextWithConfiguredProvider(text, options = {}) {
 
   const source = await getOrCreateRemoteTtsAudio(cleanText, provider, options);
 
-  await playRemoteTtsAudio(source);
+  const playback = await playRemoteTtsAudio(source);
   return {
     success: true,
     provider,
     mode: 'audio',
+    pendingPlayback: !!playback?.pendingPlayback,
     cacheHit: source.cacheHit,
     cacheSaved: source.cacheSaved,
   };
@@ -2680,7 +2796,10 @@ function renderInlineQuoteTtsButtons(root) {
     button.title = '只播放这段对白（长按重新生成）';
     button.setAttribute('aria-label', '生成并播放这段对白');
     const icon = document.createElement('i');
-    icon.className = 'fa-solid fa-volume-low';
+    icon.className = '';
+    icon.textContent = '🔊';
+    icon.style.fontFamily = 'inherit';
+    icon.style.fontStyle = 'normal';
     icon.setAttribute('aria-hidden', 'true');
     button.append(icon);
     const range = document.createRange();
@@ -2780,13 +2899,13 @@ async function runNativeTtsAction(triggerElement, options = {}) {
     triggerElement.disabled = true;
     triggerElement.setAttribute('aria-busy', 'true');
     const icon = triggerElement.querySelector('i');
-    if (icon) icon.className = 'fa-solid fa-spinner fa-spin';
+    if (icon) { icon.className = ''; icon.textContent = '…'; }
     try {
       await speakTextWithConfiguredProvider(text, { source: 'inline-quote', forceRegenerate });
     } finally {
       triggerElement.disabled = false;
       triggerElement.removeAttribute('aria-busy');
-      if (icon) icon.className = 'fa-solid fa-volume-low';
+      if (icon) { icon.className = ''; icon.textContent = '🔊'; }
     }
     return;
   }
@@ -2822,6 +2941,7 @@ async function runNativeTtsAction(triggerElement, options = {}) {
     source: 'st-native-menu',
     forceRegenerate,
   });
+  if (result.pendingPlayback) return;
   if (result.mode === 'browser') {
     showTtsToast(`开始朗读${label}`, 'success');
   } else if (forceRegenerate) {
