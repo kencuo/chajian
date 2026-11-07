@@ -3,7 +3,7 @@
 扩展提供三种语音路线：
 
 - 浏览器系统语音：仅由当前浏览器朗读，不能送入 RVC。
-- MiniMax / OpenAI 兼容 TTS：在线合成音频，再交给 RVC。
+- MiniMax / OpenAI 兼容 / ElevenLabs TTS：在线合成音频，再交给 RVC。
 - Windows 本机语音：调用此 Windows 电脑的 `/synthesize` 端点，使用系统安装的英文语音生成 WAV，再交给 Connor RVC；不需要外部 TTS 账号。
 
 ## 本机 API
