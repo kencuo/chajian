@@ -206,6 +206,7 @@ function getCharacterVoiceMap() {
 }
 
 function getCharacterTtsBinding(options = {}) {
+  if (options.ignoreCharacterBinding) return null;
   const identity = options.messageId != null
     ? getMessageCharacterVoiceIdentity(options.messageId)
     : getCurrentCharacterVoiceIdentity();
@@ -249,7 +250,14 @@ function getTtsProviderProfiles() {
 function getTtsProviderProfile(provider) {
   const profiles = getTtsProviderProfiles();
   const saved = profiles[provider];
-  if (saved && typeof saved === 'object') return { ...getDefaultTtsProviderProfile(provider), ...saved };
+  if (saved && typeof saved === 'object') {
+    const profile = { ...getDefaultTtsProviderProfile(provider), ...saved };
+    if (provider === 'elevenlabs') {
+      profile.ttsApiUrl = normalizeElevenLabsDialogueEndpoint(profile.ttsApiUrl);
+      if (profile.ttsModel === 'eleven_multilingual_v2') profile.ttsModel = getDefaultTtsModel('elevenlabs');
+    }
+    return profile;
+  }
   if (provider === pluginConfig.ttsProvider) {
     return {
       ...getDefaultTtsProviderProfile(provider),
@@ -440,14 +448,19 @@ function getMiniMaxApiHostByKey(hostKey) {
 
 function getDefaultTtsApiUrl(provider) {
   if (provider === 'minimax') return `${getMiniMaxApiHostByKey(pluginConfig.ttsMiniMaxHost)}/v1/t2a_v2`;
-  if (provider === 'elevenlabs') return 'https://api.elevenlabs.io/v1/text-to-speech';
+  if (provider === 'elevenlabs') return 'https://api.elevenlabs.io/v1/text-to-dialogue';
   return '';
 }
 
 function getDefaultTtsModel(provider) {
   if (provider === 'minimax') return 'speech-2.8-hd';
-  if (provider === 'elevenlabs') return 'eleven_multilingual_v2';
+  if (provider === 'elevenlabs') return 'eleven_v3';
   return '';
+}
+
+function normalizeElevenLabsDialogueEndpoint(value) {
+  const endpoint = String(value || '').trim() || getDefaultTtsApiUrl('elevenlabs');
+  return endpoint.replace(/\/v1\/text-to-speech(?:\/[^/?#]+)?(?=\/?(?:[?#]|$))\/?/i, '/v1/text-to-dialogue');
 }
 
 /**
@@ -480,7 +493,7 @@ function initConfig() {
       ttsPitch: coerceNumber(pluginConfig.ttsPitch, 0),
     };
   }
-  Object.assign(pluginConfig, { ...getDefaultTtsProviderProfile(activeProvider), ...profiles[activeProvider] });
+  Object.assign(pluginConfig, getTtsProviderProfile(activeProvider));
 
   // 保存到全局设置
   context.extensionSettings[MODULE_NAME] = pluginConfig;
@@ -1734,8 +1747,13 @@ function bindEventListeners() {
 
   $(document).on('click', `#${MODULE_NAME}_ttsTestBtn`, async function () {
     try {
+      const provider = pluginConfig.ttsProvider || 'browser';
+      const profile = getTtsProviderProfile(provider);
       const result = await speakTextWithConfiguredProvider(pluginConfig.ttsTestText || '你好，这是一段 TTS 试听内容。', {
         source: 'plugin-test',
+        provider,
+        voiceId: profile.ttsVoiceId,
+        ignoreCharacterBinding: true,
       });
       if (typeof toastr !== 'undefined') {
         if (!result.pendingPlayback) toastr.success('TTS 已开始播放', '语音朗读');
@@ -2562,16 +2580,8 @@ async function synthesizeOpenAICompatibleSpeech(text, profile, voiceId) {
   };
 }
 
-function buildElevenLabsTtsUrl(rawUrl, voiceId) {
-  const voicePath = encodeURIComponent(String(voiceId || '').trim());
-  const inputUrl = String(rawUrl || '').trim() || getDefaultTtsApiUrl('elevenlabs');
-  let endpoint = inputUrl.includes('{voice_id}')
-    ? inputUrl.replaceAll('{voice_id}', voicePath)
-    : inputUrl;
-  if (!inputUrl.includes('{voice_id}') && !/\/v1\/text-to-speech\/[^/?#]+(?:[?#]|$)/i.test(endpoint)) {
-    endpoint = `${endpoint.replace(/\/+$/, '')}/${voicePath}`;
-  }
-
+function buildElevenLabsTtsUrl(rawUrl) {
+  const endpoint = normalizeElevenLabsDialogueEndpoint(rawUrl);
   let url;
   try {
     url = new URL(endpoint, window.location.href);
@@ -2587,19 +2597,27 @@ async function synthesizeElevenLabsSpeech(text, profile, voiceId) {
   const model = String(profile.ttsModel || '').trim() || getDefaultTtsModel('elevenlabs');
   if (!apiKey) throw new Error('请先填写 ElevenLabs API Key');
   if (!voiceId) throw new Error('请填写默认 Voice ID，或为当前角色卡绑定 ElevenLabs 音色');
+  if (text.length > 2000) throw new Error('ElevenLabs text-to-dialogue 单次最多支持 2,000 字符，请缩短文本后重试');
 
-  const response = await fetch(buildElevenLabsTtsUrl(profile.ttsApiUrl, voiceId), {
+  const response = await fetch(buildElevenLabsTtsUrl(profile.ttsApiUrl), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'audio/mpeg',
       'xi-api-key': apiKey,
     },
-    body: JSON.stringify({ text, model_id: model }),
+    body: JSON.stringify({
+      inputs: [{ text, voice_id: String(voiceId).trim() }],
+      model_id: model,
+    }),
   });
 
   if (!response.ok) {
-    throw new Error(await parseRemoteError(response, 'ElevenLabs TTS 请求失败，请检查 API Key、Voice ID 或网络跨域设置'));
+    const detail = await parseRemoteError(response, 'ElevenLabs TTS 请求失败');
+    if (response.status === 404) {
+      throw new Error(`ElevenLabs 返回 404：请确认 Voice ID 存在且当前 API Key 有权访问该音色，并检查接口地址。${detail}`);
+    }
+    throw new Error(`${detail}（请检查 API Key、Voice ID 或网络跨域设置）`);
   }
 
   const blob = await response.blob();
