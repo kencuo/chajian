@@ -2,7 +2,7 @@
  * 智能媒体助手 - SillyTavern Extension
  * 统一的图片和文档处理插件
  * 作者: ctrl
- * 版本: 1.5.4
+ * 版本: 1.5.5
  */
 
 import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
@@ -37,6 +37,8 @@ const DEFAULT_CONFIG = {
   ttsApiKey: '',
   ttsModel: '',
   ttsVoiceId: '',
+  ttsCharacterVoices: {},
+  ttsProviderProfiles: {},
   ttsFormat: 'mp3',
   ttsGroupId: '',
   ttsMiniMaxHost: 'official',
@@ -102,6 +104,7 @@ const ttsCacheState = {
 };
 const nativeTtsIntegrationState = {
   lastMessageId: null,
+  selectedCharacterVoiceKey: '',
   chatObserver: null,
   renderTimer: null,
   domEventsBound: false,
@@ -139,6 +142,198 @@ function getPluginContextSafe() {
   } catch (error) {
     return null;
   }
+}
+
+function getCharacterVoiceIdentity(character, fallbackIndex = null) {
+  if (!character) return null;
+  const avatar = String(character.avatar || '').trim();
+  if (avatar && avatar.toLowerCase() !== 'none.png') {
+    return { key: `avatar:${avatar.toLowerCase()}`, name: String(character.name || avatar) };
+  }
+  const name = String(character.name || '').trim();
+  if (name) return { key: `name:${name.toLowerCase()}`, name };
+  if (Number.isInteger(fallbackIndex) && fallbackIndex >= 0) {
+    return { key: `index:${fallbackIndex}`, name: `角色卡 ${fallbackIndex + 1}` };
+  }
+  return null;
+}
+
+function getCurrentCharacterVoiceIdentity() {
+  const context = getPluginContextSafe();
+  const characters = Array.isArray(context?.characters) ? context.characters : [];
+  const rawIndex = context?.characterId ?? context?.this_chid ?? globalThis.this_chid;
+  const characterIndex = Number.isInteger(Number(rawIndex)) ? Number(rawIndex) : -1;
+  const character = context?.character || characters[characterIndex] || null;
+  const identity = getCharacterVoiceIdentity(character, characterIndex);
+  if (identity) return identity;
+  const name = String(context?.name2 || '').trim();
+  return name ? { key: `name:${name.toLowerCase()}`, name } : null;
+}
+
+function getAvailableCharacterVoiceIdentities() {
+  const context = getPluginContextSafe();
+  const characters = Array.isArray(context?.characters) ? context.characters : [];
+  const identities = characters
+    .map((character, index) => getCharacterVoiceIdentity(character, index))
+    .filter(Boolean);
+  const current = getCurrentCharacterVoiceIdentity();
+  if (current && !identities.some((identity) => identity.key === current.key)) identities.unshift(current);
+  return identities;
+}
+
+function getSelectedCharacterVoiceIdentity() {
+  const key = String($(`#${MODULE_NAME}_ttsCharacterSelect`).val() || nativeTtsIntegrationState.selectedCharacterVoiceKey || '');
+  return getAvailableCharacterVoiceIdentities().find((identity) => identity.key === key) || null;
+}
+
+function getMessageCharacterVoiceIdentity(messageId) {
+  const context = getPluginContextSafe();
+  const message = getChatMessageById(messageId);
+  const speaker = String(message?.name || '').trim();
+  if (speaker && speaker !== String(context?.name1 || '').trim()) {
+    const characters = Array.isArray(context?.characters) ? context.characters : [];
+    const matchIndex = characters.findIndex((character) => String(character?.name || '').trim() === speaker);
+    if (matchIndex >= 0) return getCharacterVoiceIdentity(characters[matchIndex], matchIndex);
+  }
+  return getCurrentCharacterVoiceIdentity();
+}
+
+function getCharacterVoiceMap() {
+  if (!pluginConfig.ttsCharacterVoices || typeof pluginConfig.ttsCharacterVoices !== 'object' || Array.isArray(pluginConfig.ttsCharacterVoices)) {
+    pluginConfig.ttsCharacterVoices = {};
+  }
+  return pluginConfig.ttsCharacterVoices;
+}
+
+function getCharacterTtsBinding(options = {}) {
+  const identity = options.messageId != null
+    ? getMessageCharacterVoiceIdentity(options.messageId)
+    : getCurrentCharacterVoiceIdentity();
+  if (!identity) return null;
+  const value = getCharacterVoiceMap()[identity.key];
+  if (typeof value === 'string') return { provider: 'elevenlabs', voiceId: value };
+  return value && typeof value === 'object' ? value : null;
+}
+
+function getEffectiveTtsProvider(options = {}) {
+  if (options.provider) return options.provider;
+  return String(getCharacterTtsBinding(options)?.provider || pluginConfig.ttsProvider || 'browser');
+}
+
+function getDefaultTtsProviderProfile(provider) {
+  const profile = {
+    ttsApiUrl: '',
+    ttsApiKey: '',
+    ttsModel: getDefaultTtsModel(provider),
+    ttsVoiceId: '',
+    ttsFormat: 'mp3',
+    ttsGroupId: '',
+    ttsMiniMaxHost: 'official',
+    ttsSpeed: 1,
+    ttsVolume: 1,
+    ttsPitch: 0,
+  };
+  profile.ttsApiUrl = provider === 'minimax'
+    ? `${getMiniMaxApiHostByKey(profile.ttsMiniMaxHost)}/v1/t2a_v2`
+    : getDefaultTtsApiUrl(provider);
+  return profile;
+}
+
+function getTtsProviderProfiles() {
+  if (!pluginConfig.ttsProviderProfiles || typeof pluginConfig.ttsProviderProfiles !== 'object' || Array.isArray(pluginConfig.ttsProviderProfiles)) {
+    pluginConfig.ttsProviderProfiles = {};
+  }
+  return pluginConfig.ttsProviderProfiles;
+}
+
+function getTtsProviderProfile(provider) {
+  const profiles = getTtsProviderProfiles();
+  const saved = profiles[provider];
+  if (saved && typeof saved === 'object') return { ...getDefaultTtsProviderProfile(provider), ...saved };
+  if (provider === pluginConfig.ttsProvider) {
+    return {
+      ...getDefaultTtsProviderProfile(provider),
+      ttsApiUrl: pluginConfig.ttsApiUrl || getDefaultTtsApiUrl(provider),
+      ttsApiKey: pluginConfig.ttsApiKey || '',
+      ttsModel: pluginConfig.ttsModel || getDefaultTtsModel(provider),
+      ttsVoiceId: pluginConfig.ttsVoiceId || '',
+      ttsFormat: pluginConfig.ttsFormat || 'mp3',
+      ttsGroupId: pluginConfig.ttsGroupId || '',
+      ttsMiniMaxHost: pluginConfig.ttsMiniMaxHost || 'official',
+      ttsSpeed: coerceNumber(pluginConfig.ttsSpeed, 1),
+      ttsVolume: coerceNumber(pluginConfig.ttsVolume, 1),
+      ttsPitch: coerceNumber(pluginConfig.ttsPitch, 0),
+    };
+  }
+  return getDefaultTtsProviderProfile(provider);
+}
+
+function saveActiveTtsProviderProfile() {
+  const profiles = getTtsProviderProfiles();
+  profiles[pluginConfig.ttsProvider || 'browser'] = {
+    ttsApiUrl: pluginConfig.ttsApiUrl || '',
+    ttsApiKey: pluginConfig.ttsApiKey || '',
+    ttsModel: pluginConfig.ttsModel || '',
+    ttsVoiceId: pluginConfig.ttsVoiceId || '',
+    ttsFormat: pluginConfig.ttsFormat || 'mp3',
+    ttsGroupId: pluginConfig.ttsGroupId || '',
+    ttsMiniMaxHost: pluginConfig.ttsMiniMaxHost || 'official',
+    ttsSpeed: coerceNumber(pluginConfig.ttsSpeed, 1),
+    ttsVolume: coerceNumber(pluginConfig.ttsVolume, 1),
+    ttsPitch: coerceNumber(pluginConfig.ttsPitch, 0),
+  };
+}
+
+function loadTtsProviderProfile(provider) {
+  const profile = getTtsProviderProfile(provider);
+  pluginConfig.ttsProvider = provider;
+  Object.assign(pluginConfig, profile);
+  return profile;
+}
+
+function getEffectiveTtsVoiceId(options = {}) {
+  const binding = getCharacterTtsBinding(options);
+  const provider = getEffectiveTtsProvider(options);
+  return String(binding?.voiceId || getTtsProviderProfile(provider).ttsVoiceId || '').trim();
+}
+
+function syncCharacterVoiceBindingUI() {
+  const identities = getAvailableCharacterVoiceIdentities();
+  const current = getCurrentCharacterVoiceIdentity();
+  const selected = identities.find((identity) => identity.key === nativeTtsIntegrationState.selectedCharacterVoiceKey)
+    || current
+    || identities[0]
+    || null;
+  const enabled = !!pluginConfig.enableTTS;
+  const $select = $(`#${MODULE_NAME}_ttsCharacterSelect`);
+  const $provider = $(`#${MODULE_NAME}_ttsCharacterProvider`);
+  const $voice = $(`#${MODULE_NAME}_ttsCharacterVoiceId`);
+  const $save = $(`#${MODULE_NAME}_ttsCharacterVoiceSave`);
+  const $clear = $(`#${MODULE_NAME}_ttsCharacterVoiceClear`);
+  const value = selected ? getCharacterVoiceMap()[selected.key] : null;
+  const binding = typeof value === 'string' ? { provider: 'elevenlabs', voiceId: value } : value || {};
+
+  $select.html(identities.map((identity) => `<option value="${escapeHtmlAttr(identity.key)}">${escapeHtmlAttr(identity.name)}</option>`).join(''));
+  if (selected) {
+    nativeTtsIntegrationState.selectedCharacterVoiceKey = selected.key;
+    $select.val(selected.key);
+  }
+  $provider.val(String(binding.provider || ''));
+  $voice.val(String(binding.voiceId || ''));
+  $select.prop('disabled', !enabled || identities.length === 0);
+  $provider.prop('disabled', !enabled || !selected);
+  $voice.prop('disabled', !enabled || !selected);
+  $save.prop('disabled', !enabled || !selected);
+  $clear.prop('disabled', !enabled || !selected || (!binding.provider && !binding.voiceId));
+  $(`#${MODULE_NAME}_ttsCharacterVoiceHint`).text(
+    selected
+      ? binding.provider
+        ? `「${selected.name}」将使用所选供应商配置与音色；各供应商密钥需在上方切换后分别填写。`
+        : binding.voiceId
+          ? `「${selected.name}」跟随全局供应商，但使用此处指定的 Voice ID。`
+          : `为「${selected.name}」选择供应商和可选 Voice ID；两项留空时跟随全局默认。各供应商密钥需分别配置。`
+      : '当前没有可用的角色卡。',
+  );
 }
 
 function getSelfUpdateInstallInfo() {
@@ -245,11 +440,13 @@ function getMiniMaxApiHostByKey(hostKey) {
 
 function getDefaultTtsApiUrl(provider) {
   if (provider === 'minimax') return `${getMiniMaxApiHostByKey(pluginConfig.ttsMiniMaxHost)}/v1/t2a_v2`;
+  if (provider === 'elevenlabs') return 'https://api.elevenlabs.io/v1/text-to-speech';
   return '';
 }
 
 function getDefaultTtsModel(provider) {
   if (provider === 'minimax') return 'speech-2.8-hd';
+  if (provider === 'elevenlabs') return 'eleven_multilingual_v2';
   return '';
 }
 
@@ -266,9 +463,24 @@ function initConfig() {
 
   // 合并默认配置和用户配置
   pluginConfig = { ...DEFAULT_CONFIG, ...extensionSettings };
-  if (pluginConfig.ttsProvider === 'minimax' && !String(pluginConfig.ttsApiUrl || '').trim()) {
-    pluginConfig.ttsApiUrl = getDefaultTtsApiUrl('minimax');
+  const activeProvider = pluginConfig.ttsProvider || 'browser';
+  const profiles = getTtsProviderProfiles();
+  if (!profiles[activeProvider] || typeof profiles[activeProvider] !== 'object') {
+    profiles[activeProvider] = {
+      ...getDefaultTtsProviderProfile(activeProvider),
+      ttsApiUrl: pluginConfig.ttsApiUrl || getDefaultTtsApiUrl(activeProvider),
+      ttsApiKey: pluginConfig.ttsApiKey || '',
+      ttsModel: pluginConfig.ttsModel || getDefaultTtsModel(activeProvider),
+      ttsVoiceId: pluginConfig.ttsVoiceId || '',
+      ttsFormat: pluginConfig.ttsFormat || 'mp3',
+      ttsGroupId: pluginConfig.ttsGroupId || '',
+      ttsMiniMaxHost: pluginConfig.ttsMiniMaxHost || 'official',
+      ttsSpeed: coerceNumber(pluginConfig.ttsSpeed, 1),
+      ttsVolume: coerceNumber(pluginConfig.ttsVolume, 1),
+      ttsPitch: coerceNumber(pluginConfig.ttsPitch, 0),
+    };
   }
+  Object.assign(pluginConfig, { ...getDefaultTtsProviderProfile(activeProvider), ...profiles[activeProvider] });
 
   // 保存到全局设置
   context.extensionSettings[MODULE_NAME] = pluginConfig;
@@ -807,6 +1019,7 @@ function initPlugin() {
   // 绑定事件监听器
   bindEventListeners();
   syncTtsFormState();
+  syncCharacterVoiceBindingUI();
   initNativeTtsIntegrations();
   scheduleSelfUpdateCheck();
 
@@ -876,6 +1089,9 @@ function addPluginStyles() {
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 8px;
     }
+    #smart-media-assistant-settings .sma-character-voice-binding { grid-column: 1 / -1; }
+    #smart-media-assistant-settings .sma-character-voice-current { margin: 4px 0 8px; opacity: 0.8; }
+    #smart-media-assistant-settings .sma-character-voice-actions { display: flex; gap: 8px; }
     #smart-media-assistant-settings .sma-label {
       display: block;
       margin-bottom: 4px;
@@ -1057,6 +1273,7 @@ function createSettingsHTML() {
                   <option value="windows-local" ${ttsProvider === 'windows-local' ? 'selected' : ''}>Windows 本机语音（可接 RVC）</option>
                   <option value="minimax" ${ttsProvider === 'minimax' ? 'selected' : ''}>MiniMax HTTP TTS</option>
                   <option value="openai-compatible" ${ttsProvider === 'openai-compatible' ? 'selected' : ''}>OpenAI 兼容 TTS</option>
+                  <option value="elevenlabs" ${ttsProvider === 'elevenlabs' ? 'selected' : ''}>ElevenLabs</option>
                 </select>
                 <div class="sma-help" id="${MODULE_NAME}_ttsRemoteHint"></div>
               </div>
@@ -1097,6 +1314,24 @@ function createSettingsHTML() {
                   <div>
                     <label class="sma-label" for="${MODULE_NAME}_ttsVoiceId">音色 ID / Voice</label>
                     <input type="text" id="${MODULE_NAME}_ttsVoiceId" class="text_pole sma-field" value="${ttsVoiceId}" placeholder="例如：female-tianmei" />
+                  </div>
+                  <div class="sma-character-voice-binding">
+                    <label class="sma-label" for="${MODULE_NAME}_ttsCharacterSelect">角色卡语音设置</label>
+                    <select id="${MODULE_NAME}_ttsCharacterSelect" class="text_pole sma-field"></select>
+                    <div class="sma-grid-2">
+                      <select id="${MODULE_NAME}_ttsCharacterProvider" class="text_pole sma-field">
+                        <option value="">跟随全局默认供应商</option>
+                        <option value="elevenlabs">ElevenLabs</option>
+                        <option value="minimax">MiniMax</option>
+                        <option value="openai-compatible">OpenAI 兼容</option>
+                      </select>
+                      <input type="text" id="${MODULE_NAME}_ttsCharacterVoiceId" class="text_pole sma-field" placeholder="可选：专用 Voice ID；留空用供应商默认" />
+                    </div>
+                    <div class="sma-character-voice-actions">
+                      <button type="button" class="menu_button" id="${MODULE_NAME}_ttsCharacterVoiceSave">保存角色设置</button>
+                      <button type="button" class="menu_button" id="${MODULE_NAME}_ttsCharacterVoiceClear">恢复全局默认</button>
+                    </div>
+                    <div class="sma-help" id="${MODULE_NAME}_ttsCharacterVoiceHint"></div>
                   </div>
                   <div>
                     <label class="sma-label" for="${MODULE_NAME}_ttsFormat">音频格式</label>
@@ -1266,6 +1501,7 @@ function syncTtsFormState() {
   ];
 
   remoteSelectors.forEach((selector) => $(selector).prop('disabled', isBrowser || isWindowsLocal || !pluginConfig.enableTTS));
+  $(`#${MODULE_NAME}_ttsFormat`).prop('disabled', isBrowser || isWindowsLocal || provider === 'elevenlabs' || !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsMiniMaxHost`).prop('disabled', !isMiniMax || !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsGroupId`).prop('disabled', !isMiniMax || !pluginConfig.enableTTS);
   $(`#${MODULE_NAME}_ttsTestBtn`).prop('disabled', !pluginConfig.enableTTS);
@@ -1281,11 +1517,14 @@ function syncTtsFormState() {
       'MiniMax 需要 API Key 和 Group ID；生成的语音会保存在浏览器中，消息喇叭长按可重新生成。';
   } else if (provider === 'openai-compatible') {
     helpText = '填写完整的 /audio/speech 地址；生成的语音会保存在浏览器中，消息喇叭长按可重新生成。';
+  } else if (provider === 'elevenlabs') {
+    helpText = '填写 ElevenLabs API Key、模型和默认 Voice ID；也可在下方为角色卡单独绑定 Voice ID。音频以 MP3 返回。';
   } else if (provider === 'windows-local') {
     helpText = '通过本机 RVC 服务的 /synthesize 端点使用 Windows 英文系统语音；无需 TTS 账号。请输入英文测试文本，并启用 RVC 转换以输出 Connor 音色。';
   }
 
   $(`#${MODULE_NAME}_ttsRemoteHint`).text(helpText);
+  syncCharacterVoiceBindingUI();
 }
 
 /**
@@ -1359,22 +1598,19 @@ function bindEventListeners() {
   });
 
   $(document).on('change', `#${MODULE_NAME}_ttsProvider`, function () {
-    pluginConfig.ttsProvider = String($(this).val() || 'browser');
-    const currentApiUrl = String(pluginConfig.ttsApiUrl || '').trim();
-    if (
-      pluginConfig.ttsProvider === 'minimax' &&
-      (!currentApiUrl || /\/audio\/speech/i.test(currentApiUrl) || !/minimax/i.test(currentApiUrl))
-    ) {
-      pluginConfig.ttsApiUrl = getDefaultTtsApiUrl(pluginConfig.ttsProvider);
-      $(`#${MODULE_NAME}_ttsApiUrl`).val(pluginConfig.ttsApiUrl);
-    } else if (!pluginConfig.ttsApiUrl) {
-      pluginConfig.ttsApiUrl = getDefaultTtsApiUrl(pluginConfig.ttsProvider);
-      $(`#${MODULE_NAME}_ttsApiUrl`).val(pluginConfig.ttsApiUrl);
-    }
-    if (!pluginConfig.ttsModel) {
-      pluginConfig.ttsModel = getDefaultTtsModel(pluginConfig.ttsProvider);
-      $(`#${MODULE_NAME}_ttsModel`).val(pluginConfig.ttsModel);
-    }
+    saveActiveTtsProviderProfile();
+    const provider = String($(this).val() || 'browser');
+    loadTtsProviderProfile(provider);
+    $(`#${MODULE_NAME}_ttsApiUrl`).val(pluginConfig.ttsApiUrl || '');
+    $(`#${MODULE_NAME}_ttsApiKey`).val(pluginConfig.ttsApiKey || '');
+    $(`#${MODULE_NAME}_ttsModel`).val(pluginConfig.ttsModel || '');
+    $(`#${MODULE_NAME}_ttsVoiceId`).val(pluginConfig.ttsVoiceId || '');
+    $(`#${MODULE_NAME}_ttsFormat`).val(pluginConfig.ttsFormat || 'mp3');
+    $(`#${MODULE_NAME}_ttsGroupId`).val(pluginConfig.ttsGroupId || '');
+    $(`#${MODULE_NAME}_ttsMiniMaxHost`).val(pluginConfig.ttsMiniMaxHost || 'official');
+    $(`#${MODULE_NAME}_ttsSpeed`).val(coerceNumber(pluginConfig.ttsSpeed, 1));
+    $(`#${MODULE_NAME}_ttsVolume`).val(coerceNumber(pluginConfig.ttsVolume, 1));
+    $(`#${MODULE_NAME}_ttsPitch`).val(coerceNumber(pluginConfig.ttsPitch, 0));
     syncTtsFormState();
     saveSettings();
   });
@@ -1411,6 +1647,38 @@ function bindEventListeners() {
   $(document).on('input change', `#${MODULE_NAME}_ttsVoiceId`, function () {
     pluginConfig.ttsVoiceId = String($(this).val() || '').trim();
     saveSettings();
+  });
+
+  $(document).on('change', `#${MODULE_NAME}_ttsCharacterSelect`, function () {
+    nativeTtsIntegrationState.selectedCharacterVoiceKey = String($(this).val() || '');
+    syncCharacterVoiceBindingUI();
+  });
+
+  $(document).on('click', `#${MODULE_NAME}_ttsCharacterVoiceSave`, function () {
+    const identity = getSelectedCharacterVoiceIdentity();
+    if (!identity) {
+      showTtsToast('请先打开一张角色卡，再绑定音色', 'error');
+      return;
+    }
+    const provider = String($(`#${MODULE_NAME}_ttsCharacterProvider`).val() || '').trim();
+    const voiceId = String($(`#${MODULE_NAME}_ttsCharacterVoiceId`).val() || '').trim();
+    if (!provider && !voiceId) {
+      delete getCharacterVoiceMap()[identity.key];
+    } else {
+      getCharacterVoiceMap()[identity.key] = { provider, voiceId };
+    }
+    saveSettings();
+    syncCharacterVoiceBindingUI();
+    showTtsToast(`已保存「${identity.name}」的语音设置`, 'success');
+  });
+
+  $(document).on('click', `#${MODULE_NAME}_ttsCharacterVoiceClear`, function () {
+    const identity = getSelectedCharacterVoiceIdentity();
+    if (!identity) return;
+    delete getCharacterVoiceMap()[identity.key];
+    saveSettings();
+    syncCharacterVoiceBindingUI();
+    showTtsToast(`已解除「${identity.name}」的音色绑定`);
   });
 
   $(document).on('change', `#${MODULE_NAME}_ttsFormat`, function () {
@@ -1538,6 +1806,7 @@ function bindEventListeners() {
 function saveSettings() {
   const context = typeof getContext === 'function' ? getContext() : null;
   if (!context) return;
+  saveActiveTtsProviderProfile();
   context.extensionSettings = context.extensionSettings || {};
   context.extensionSettings[MODULE_NAME] = pluginConfig;
   saveSettingsDebounced();
@@ -1804,18 +2073,19 @@ function pickBrowserVoice(keyword) {
   return voices.find((voice) => String(voice.lang || '').toLowerCase().startsWith('zh')) || voices[0] || null;
 }
 
-function playViaBrowserSpeech(text) {
+function playViaBrowserSpeech(text, voiceId = '') {
   if (typeof speechSynthesis === 'undefined' || typeof SpeechSynthesisUtterance === 'undefined') {
     throw new Error('当前浏览器不支持 speechSynthesis');
   }
 
   stopSpeaking();
   const utterance = new SpeechSynthesisUtterance(text);
-  const voice = pickBrowserVoice(pluginConfig.ttsVoiceId);
+  const profile = getTtsProviderProfile('browser');
+  const voice = pickBrowserVoice(voiceId || profile.ttsVoiceId);
   if (voice) utterance.voice = voice;
-  utterance.rate = clamp(coerceNumber(pluginConfig.ttsSpeed, 1), 0.1, 10);
-  utterance.volume = clamp(coerceNumber(pluginConfig.ttsVolume, 1), 0, 1);
-  utterance.pitch = clamp(1 + coerceNumber(pluginConfig.ttsPitch, 0) * 0.1, 0, 2);
+  utterance.rate = clamp(coerceNumber(profile.ttsSpeed, 1), 0.1, 10);
+  utterance.volume = clamp(coerceNumber(profile.ttsVolume, 1), 0, 1);
+  utterance.pitch = clamp(1 + coerceNumber(profile.ttsPitch, 0) * 0.1, 0, 2);
   utterance.onstart = () => {
     ttsPlaybackState.activeMode = 'browser';
     ttsPlaybackState.isSpeaking = true;
@@ -1834,9 +2104,9 @@ function playViaBrowserSpeech(text) {
   speechSynthesis.speak(utterance);
 }
 
-function buildMiniMaxTtsUrl(rawUrl, groupId) {
+function buildMiniMaxTtsUrl(rawUrl, groupId, hostKey = 'official') {
   const value = String(rawUrl || '').trim();
-  const sourceBase = getMiniMaxApiHostByKey(pluginConfig.ttsMiniMaxHost);
+  const sourceBase = getMiniMaxApiHostByKey(hostKey);
   const fallback = `${sourceBase}/v1/t2a_v2`;
   const inputUrl = value || fallback;
   const endpointUrl = /\/v1\/t2a_v2(?:[/?]|$)/i.test(inputUrl)
@@ -1931,22 +2201,26 @@ function runTtsCacheTransaction(mode, operation) {
   );
 }
 
-function getTtsCacheDescriptor(text, provider) {
+function getTtsCacheDescriptor(text, provider, options = {}) {
+  const profile = getTtsProviderProfile(provider);
   const format = provider === 'windows-local'
     ? 'wav'
-    : String(pluginConfig.ttsFormat || 'mp3').trim().toLowerCase() || 'mp3';
+    : provider === 'elevenlabs'
+      ? 'mp3'
+      : String(profile.ttsFormat || 'mp3').trim().toLowerCase() || 'mp3';
+  const voiceId = String(options.voiceId || getEffectiveTtsVoiceId({ ...options, provider }) || '').trim();
   const signature = JSON.stringify({
     version: 1,
     text,
     provider,
-    apiUrl: String(pluginConfig.ttsApiUrl || '').trim(),
-    groupId: provider === 'minimax' ? String(pluginConfig.ttsGroupId || '').trim() : '',
-    model: String(pluginConfig.ttsModel || '').trim() || getDefaultTtsModel(provider),
-    voiceId: String(pluginConfig.ttsVoiceId || '').trim(),
+    apiUrl: String(profile.ttsApiUrl || '').trim(),
+    groupId: provider === 'minimax' ? String(profile.ttsGroupId || '').trim() : '',
+    model: String(profile.ttsModel || '').trim() || getDefaultTtsModel(provider),
+    voiceId,
     format,
-    speed: coerceNumber(pluginConfig.ttsSpeed, 1),
-    volume: coerceNumber(pluginConfig.ttsVolume, 1),
-    pitch: coerceNumber(pluginConfig.ttsPitch, 0),
+    speed: coerceNumber(profile.ttsSpeed, 1),
+    volume: coerceNumber(profile.ttsVolume, 1),
+    pitch: coerceNumber(profile.ttsPitch, 0),
     rvc: pluginConfig.enableRvcConversion
       ? {
           enabled: true,
@@ -1961,6 +2235,7 @@ function getTtsCacheDescriptor(text, provider) {
     key: `${provider}:${getStringHash(signature)}`,
     signature,
     format,
+    voiceId,
   };
 }
 
@@ -2081,6 +2356,8 @@ async function renderTtsCacheLibrary() {
         const title = fullText.length > 500 ? `${fullText.slice(0, 500)}…` : fullText;
         const provider = record.provider === 'minimax'
           ? 'MiniMax'
+          : record.provider === 'elevenlabs'
+            ? 'ElevenLabs'
           : record.provider === 'windows-local'
             ? 'Windows 本机语音'
             : 'OpenAI 兼容';
@@ -2192,36 +2469,36 @@ function getFriendlyFetchErrorMessage(error, provider = '') {
   return rawMessage;
 }
 
-async function synthesizeMiniMaxSpeech(text) {
-  const apiKey = String(pluginConfig.ttsApiKey || '').trim();
-  const groupId = String(pluginConfig.ttsGroupId || '').trim();
-  const voiceId = String(pluginConfig.ttsVoiceId || '').trim();
+async function synthesizeMiniMaxSpeech(text, profile, voiceId) {
+  const apiKey = String(profile.ttsApiKey || '').trim();
+  const groupId = String(profile.ttsGroupId || '').trim();
+  const voice = String(voiceId || profile.ttsVoiceId || '').trim();
   if (!apiKey) throw new Error('请先填写 MiniMax API Key');
   if (!groupId) throw new Error('请先填写 MiniMax Group ID');
-  if (!voiceId) throw new Error('请先填写 MiniMax 音色 ID');
+  if (!voice) throw new Error('请先填写 MiniMax 音色 ID');
 
-  const response = await fetch(buildMiniMaxTtsUrl(pluginConfig.ttsApiUrl, groupId), {
+  const response = await fetch(buildMiniMaxTtsUrl(profile.ttsApiUrl, groupId, profile.ttsMiniMaxHost), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: String(pluginConfig.ttsModel || '').trim() || 'speech-2.8-hd',
+      model: String(profile.ttsModel || '').trim() || 'speech-2.8-hd',
       text,
       stream: false,
       language_boost: 'auto',
       output_format: 'hex',
       voice_setting: {
-        voice_id: voiceId,
-        speed: coerceNumber(pluginConfig.ttsSpeed, 1),
-        vol: coerceNumber(pluginConfig.ttsVolume, 1),
-        pitch: coerceNumber(pluginConfig.ttsPitch, 0),
+        voice_id: voice,
+        speed: coerceNumber(profile.ttsSpeed, 1),
+        vol: coerceNumber(profile.ttsVolume, 1),
+        pitch: coerceNumber(profile.ttsPitch, 0),
       },
       audio_setting: {
         sample_rate: 32000,
         bitrate: 128000,
-        format: String(pluginConfig.ttsFormat || 'mp3').trim() || 'mp3',
+        format: String(profile.ttsFormat || 'mp3').trim() || 'mp3',
         channel: 1,
       },
     }),
@@ -2240,19 +2517,19 @@ async function synthesizeMiniMaxSpeech(text) {
   }
 
   return {
-    blob: hexToAudioBlob(data?.data?.audio, pluginConfig.ttsFormat || 'mp3'),
+    blob: hexToAudioBlob(data?.data?.audio, profile.ttsFormat || 'mp3'),
   };
 }
 
-async function synthesizeOpenAICompatibleSpeech(text) {
-  const apiUrl = String(pluginConfig.ttsApiUrl || '').trim();
-  const apiKey = String(pluginConfig.ttsApiKey || '').trim();
-  const model = String(pluginConfig.ttsModel || '').trim();
-  const voiceId = String(pluginConfig.ttsVoiceId || '').trim();
+async function synthesizeOpenAICompatibleSpeech(text, profile, voiceId) {
+  const apiUrl = String(profile.ttsApiUrl || '').trim();
+  const apiKey = String(profile.ttsApiKey || '').trim();
+  const model = String(profile.ttsModel || '').trim();
+  const voice = String(voiceId || profile.ttsVoiceId || '').trim();
   if (!apiUrl) throw new Error('请先填写 OpenAI 兼容 TTS 接口地址');
   if (!apiKey) throw new Error('请先填写 OpenAI 兼容 TTS 的 API Key');
   if (!model) throw new Error('请先填写 OpenAI 兼容 TTS 的模型名');
-  if (!voiceId) throw new Error('请先填写 OpenAI 兼容 TTS 的 voice');
+  if (!voice) throw new Error('请先填写 OpenAI 兼容 TTS 的 voice');
 
   const response = await fetch(apiUrl, {
     method: 'POST',
@@ -2262,10 +2539,10 @@ async function synthesizeOpenAICompatibleSpeech(text) {
     },
     body: JSON.stringify({
       model,
-      voice: voiceId,
+      voice,
       input: text,
-      response_format: String(pluginConfig.ttsFormat || 'mp3').trim() || 'mp3',
-      speed: coerceNumber(pluginConfig.ttsSpeed, 1),
+      response_format: String(profile.ttsFormat || 'mp3').trim() || 'mp3',
+      speed: coerceNumber(profile.ttsSpeed, 1),
     }),
   });
 
@@ -2285,8 +2562,55 @@ async function synthesizeOpenAICompatibleSpeech(text) {
   };
 }
 
+function buildElevenLabsTtsUrl(rawUrl, voiceId) {
+  const voicePath = encodeURIComponent(String(voiceId || '').trim());
+  const inputUrl = String(rawUrl || '').trim() || getDefaultTtsApiUrl('elevenlabs');
+  let endpoint = inputUrl.includes('{voice_id}')
+    ? inputUrl.replaceAll('{voice_id}', voicePath)
+    : inputUrl;
+  if (!inputUrl.includes('{voice_id}') && !/\/v1\/text-to-speech\/[^/?#]+(?:[?#]|$)/i.test(endpoint)) {
+    endpoint = `${endpoint.replace(/\/+$/, '')}/${voicePath}`;
+  }
+
+  let url;
+  try {
+    url = new URL(endpoint, window.location.href);
+  } catch (error) {
+    throw new Error('ElevenLabs 接口地址格式不正确');
+  }
+  url.searchParams.set('output_format', 'mp3_44100_128');
+  return url.toString();
+}
+
+async function synthesizeElevenLabsSpeech(text, profile, voiceId) {
+  const apiKey = String(profile.ttsApiKey || '').trim();
+  const model = String(profile.ttsModel || '').trim() || getDefaultTtsModel('elevenlabs');
+  if (!apiKey) throw new Error('请先填写 ElevenLabs API Key');
+  if (!voiceId) throw new Error('请填写默认 Voice ID，或为当前角色卡绑定 ElevenLabs 音色');
+
+  const response = await fetch(buildElevenLabsTtsUrl(profile.ttsApiUrl, voiceId), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'audio/mpeg',
+      'xi-api-key': apiKey,
+    },
+    body: JSON.stringify({ text, model_id: model }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await parseRemoteError(response, 'ElevenLabs TTS 请求失败，请检查 API Key、Voice ID 或网络跨域设置'));
+  }
+
+  const blob = await response.blob();
+  if (!blob?.size) throw new Error('ElevenLabs 未返回音频数据');
+  return { blob: new Blob([blob], { type: 'audio/mpeg' }) };
+}
+
 async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
-  const descriptor = getTtsCacheDescriptor(text, provider);
+  const profile = getTtsProviderProfile(provider);
+  const voiceId = String(options.voiceId || getEffectiveTtsVoiceId({ ...options, provider }) || '').trim();
+  const descriptor = getTtsCacheDescriptor(text, provider, { ...options, voiceId });
   if (!options.forceRegenerate) {
     // A finished generation remains reusable while its background save runs.
     const inFlight = ttsCacheState.pendingSynthesis.get(descriptor.key);
@@ -2303,10 +2627,12 @@ async function getOrCreateRemoteTtsAudio(text, provider, options = {}) {
   const createAudio = async () => {
     let source =
       provider === 'minimax'
-        ? await synthesizeMiniMaxSpeech(text)
+        ? await synthesizeMiniMaxSpeech(text, profile, voiceId)
+        : provider === 'elevenlabs'
+          ? await synthesizeElevenLabsSpeech(text, profile, voiceId)
         : provider === 'windows-local'
           ? await synthesizeWindowsLocalSpeech(text)
-          : await synthesizeOpenAICompatibleSpeech(text);
+          : await synthesizeOpenAICompatibleSpeech(text, profile, voiceId);
     if (pluginConfig.enableRvcConversion && !source.rvcApplied) {
       source = await convertAudioWithRvc(source.blob);
     }
@@ -2495,7 +2821,7 @@ async function speakTextWithConfiguredProvider(text, options = {}) {
     throw new Error('没有可用于朗读的文本');
   }
 
-  const provider = options.provider || pluginConfig.ttsProvider || 'browser';
+  const provider = getEffectiveTtsProvider(options);
   if (pluginConfig.enableLogging) {
     console.log('[Smart Media Assistant] TTS 开始朗读', {
       provider,
@@ -2506,9 +2832,9 @@ async function speakTextWithConfiguredProvider(text, options = {}) {
 
   if (provider === 'browser') {
     if (pluginConfig.enableRvcConversion) {
-      throw new Error('RVC 音色转换需要音频型 TTS，请切换为 Windows 本机语音、MiniMax 或 OpenAI 兼容');
+      throw new Error('RVC 音色转换需要音频型 TTS，请切换为 Windows 本机语音、MiniMax、OpenAI 兼容或 ElevenLabs');
     }
-    playViaBrowserSpeech(cleanText);
+    playViaBrowserSpeech(cleanText, getEffectiveTtsVoiceId({ ...options, provider }));
     return { success: true, provider, mode: 'browser' };
   }
   if (provider === 'windows-local' && !pluginConfig.enableRvcConversion) {
@@ -2751,20 +3077,19 @@ async function downloadChatMessageTtsById(messageId, mode = 'content', options =
   if (!pluginConfig.enableTTS) {
     throw new Error('TTS 功能已关闭，请先在插件设置中开启');
   }
-  const provider = options.provider || pluginConfig.ttsProvider || 'browser';
-  if (provider === 'browser') {
-    throw new Error('浏览器系统语音不提供音频文件，请切换到 MiniMax 或 OpenAI 兼容 TTS 后下载');
-  }
-
   const resolvedId = resolveTargetMessageId(messageId);
   if (resolvedId === null) throw new Error('未找到可下载语音的消息');
+  const provider = getEffectiveTtsProvider({ ...options, messageId: resolvedId });
+  if (provider === 'browser') {
+    throw new Error('浏览器系统语音不提供音频文件，请切换到 MiniMax、OpenAI 兼容或 ElevenLabs TTS 后下载');
+  }
   const text = getChatMessageTtsText(resolvedId, mode);
   if (!text) {
     throw new Error(mode === 'quote' ? '这条消息里没有双引号内容' : '这条消息没有可生成语音的正文');
   }
 
   const cleanText = sanitizeTtsText(text);
-  const source = await getOrCreateRemoteTtsAudio(cleanText, provider, options);
+  const source = await getOrCreateRemoteTtsAudio(cleanText, provider, { ...options, messageId: resolvedId });
   const format = source.descriptor.format || 'mp3';
   downloadTtsBlob(source.blob, `tts-message-${resolvedId}-${mode}.${format}`);
   return source;
@@ -2931,7 +3256,7 @@ async function runNativeTtsAction(triggerElement, options = {}) {
     const icon = triggerElement.querySelector('i');
     if (icon) { icon.className = ''; icon.textContent = '…'; }
     try {
-      await speakTextWithConfiguredProvider(text, { source: 'inline-quote', forceRegenerate });
+      await speakTextWithConfiguredProvider(text, { source: 'inline-quote', forceRegenerate, messageId });
     } finally {
       triggerElement.disabled = false;
       triggerElement.removeAttribute('aria-busy');
@@ -3085,7 +3410,11 @@ function bindNativeTtsContextEvents() {
   if (!context?.eventSource || !context?.eventTypes) return;
 
   nativeTtsIntegrationState.contextEventsBound = true;
-  const refresh = () => queueNativeTtsButtonsRefresh(0);
+  const refresh = () => {
+    nativeTtsIntegrationState.selectedCharacterVoiceKey = getCurrentCharacterVoiceIdentity()?.key || '';
+    syncCharacterVoiceBindingUI();
+    queueNativeTtsButtonsRefresh(0);
+  };
   const events = [
     context.eventTypes.CHAT_CHANGED,
     context.eventTypes.MESSAGE_RECEIVED,
